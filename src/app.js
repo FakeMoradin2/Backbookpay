@@ -9,8 +9,8 @@ app.use(express.json());
 // Rutas
 
 app.use('/api/negocios', require('./routes/negocios.routes'));
-/*app.use('/api/servicios', require('./routes/servicios.routes'));
-app.use('/api/reservas', require('./routes/reservas.routes'));
+app.use('/api/servicios', require('./routes/servicios.routes'));
+/*app.use('/api/reservas', require('./routes/reservas.routes'));
 app.use('/api/pagos', require('./routes/pagos.routes')); */
 app.use('/api/health', require('./routes/health.routes'));
 app.use('/api/auth', require('./routes/auth.routes'));
