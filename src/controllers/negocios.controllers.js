@@ -47,7 +47,7 @@ const getNegocioPublic = async (req, res) => {
     if (error) {
       return res.status(404).json({
         ok: false,
-        error: 'Negocio no encontrado',
+        error: 'Business not found',
       });
     }
 
@@ -86,7 +86,7 @@ const getNegocioAdmin = async (req, res) => {
     if (!data) {
       return res.status(404).json({
         ok: false,
-        error: 'Negocio no encontrado',
+        error: 'Business not found',
       });
     }
 
@@ -113,7 +113,7 @@ const updateNegocioAdmin = async (req, res) => {
     if (rolUser !== 'admin') {
       return res.status(403).json({
         ok: false,
-        error: 'No tienes permisos para actualizar el negocio',
+        error: 'You do not have permission to update the business',
       });
     }
 
@@ -138,7 +138,7 @@ const updateNegocioAdmin = async (req, res) => {
     if (Object.keys(updateData).length === 0) {
       return res.status(400).json({
         ok: false,
-        error: 'No se enviaron campos para actualizar',
+        error: 'No fields were provided for update',
       });
     }
 

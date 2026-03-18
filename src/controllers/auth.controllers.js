@@ -9,7 +9,7 @@ const login = async (req, res) => {
         if (!email || !password) {
             return res.status(400).json({
                 ok: false,
-                error: 'Email y contraseña son requeridos',
+                error: "Email and password are required",
             });
         }
 
@@ -68,14 +68,14 @@ const register = async (req, res) => {
       if (!email || !password || !nombre) {
         return res.status(400).json({
           ok: false,
-          error: "Email, contraseña y/o nombre son requeridos",
+          error: "Email, password and nombre are required",
         });
       }
   
       if (!["admin", "staff", "cliente"].includes(rol)) {
         return res.status(400).json({
           ok: false,
-          error: "Rol inválido",
+          error: "Invalid role",
         });
       }
   
@@ -83,7 +83,7 @@ const register = async (req, res) => {
       if (rol === "admin" && invite_code !== process.env.ADMIN_INVITE_CODE) {
         return res.status(403).json({
           ok: false,
-          error: "Código de invitación inválido",
+          error: "Invalid invitation code",
         });
       }
   
@@ -107,7 +107,7 @@ const register = async (req, res) => {
       if (!userId) {
         return res.status(500).json({
           ok: false,
-          error: "No se pudo obtener el userId después del registro",
+          error: "Could not get user id after registration",
         });
       }
   
@@ -122,7 +122,7 @@ const register = async (req, res) => {
         if (!negocio_id) {
           return res.status(400).json({
             ok: false,
-            error: "Negocio es requerido para staff",
+            error: "negocio_id is required for staff users",
           });
         }
         finalNegocioId = negocio_id;
@@ -133,7 +133,7 @@ const register = async (req, res) => {
         const { data: negocioCreado, error: negocioError } = await supabase
           .from("negocios")
           .insert({
-            nombre: `negocio de ${nombre}`,
+            nombre: `${nombre}'s business`,
             zona_horaria: "america/mexico_city",
             duracion_buffer_min: 0,
             activo: true,
@@ -173,7 +173,7 @@ const register = async (req, res) => {
       if (rol === "admin") {
         return res.status(201).json({
           ok: true,
-          message: "Cuenta admin creada. Inicia sesión para obtener token.",
+          message: "Admin account created. Sign in to get tokens.",
           user_id: userId,
           negocio_id: finalNegocioId,
         });
@@ -183,10 +183,10 @@ const register = async (req, res) => {
       const session = data.session;
   
       if (!session) {
-        // pasa cuando hay confirmación de email activada
+        // Happens when email confirmation is enabled
         return res.status(201).json({
           ok: true,
-          message: "Cuenta creada. Inicia sesión para obtener token.",
+          message: "Account created. Sign in to get tokens.",
           user_id: userId,
         });
       }
@@ -215,7 +215,7 @@ const register = async (req, res) => {
       if (!refresh_token) {
         return res.status(400).json({
           ok: false,
-          error: "Falta refresh_token",
+          error: "Missing refresh_token",
         });
       }
   
@@ -226,7 +226,7 @@ const register = async (req, res) => {
       if (error || !data?.session) {
         return res.status(401).json({
           ok: false,
-          error: error?.message || "No se pudo refrescar sesión",
+          error: error?.message || "Could not refresh session",
         });
       }
   
@@ -250,7 +250,7 @@ const register = async (req, res) => {
   const logout = async (req, res) => {
     return res.json({
       ok: true,
-      message: "Logout correcto. El cliente debe eliminar los tokens.",
+      message: "Logout successful. The client must remove stored tokens.",
     });
   };
 

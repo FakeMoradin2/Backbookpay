@@ -1,10 +1,10 @@
 const supabase = require("../config/supabase");
 
-// helper para validar días permitidos
+// Helper to validate allowed weekday values
 const diasValidos = ["lun", "mar", "mie", "jue", "vie", "sab", "dom"];
 
-// helper para saber si dos bloques se traslapan
-// permite bloques pegados, por ejemplo:
+// Helper to detect overlap between two schedule blocks
+// Adjacent blocks are allowed, for example:
 // 09:00-13:00 y 13:00-18:00 
 const haySolapamiento = (inicioA, finA, inicioB, finB) => {
   return inicioA < finB && finA > inicioB;
@@ -51,7 +51,7 @@ const createHorarioAdmin = async (req, res) => {
     if (rolUser !== "admin") {
       return res.status(403).json({
         ok: false,
-        error: "No tienes permisos para crear horarios",
+        error: "You do not have permission to create schedules",
       });
     }
 
@@ -62,29 +62,29 @@ const createHorarioAdmin = async (req, res) => {
       activo = true,
     } = req.body;
 
-    // validaciones base
+    // Basic validations
     if (!dia_semana || !hora_inicio || !hora_fin) {
       return res.status(400).json({
         ok: false,
-        error: "dia_semana, hora_inicio y hora_fin son requeridos",
+        error: "dia_semana, hora_inicio and hora_fin are required",
       });
     }
 
     if (!diasValidos.includes(dia_semana)) {
       return res.status(400).json({
         ok: false,
-        error: "dia_semana inválido",
+        error: "Invalid dia_semana value",
       });
     }
 
     if (hora_inicio >= hora_fin) {
       return res.status(400).json({
         ok: false,
-        error: "hora_inicio debe ser menor que hora_fin",
+        error: "hora_inicio must be earlier than hora_fin",
       });
     }
 
-    // traer bloques activos del mismo día
+    // Fetch active blocks for the same day
     const { data: horariosExistentes, error: errorExistentes } = await supabase
       .from("horarios")
       .select("*")
@@ -99,12 +99,12 @@ const createHorarioAdmin = async (req, res) => {
       });
     }
 
-    // validar solapamiento
+    // Validate overlaps
     for (const horario of horariosExistentes || []) {
       if (haySolapamiento(hora_inicio, hora_fin, horario.hora_inicio, horario.hora_fin)) {
         return res.status(400).json({
           ok: false,
-          error: "El horario se traslapa con otro bloque existente",
+          error: "The schedule overlaps with an existing block",
         });
       }
     }
@@ -150,11 +150,11 @@ const updateHorarioAdmin = async (req, res) => {
     if (rolUser !== "admin") {
       return res.status(403).json({
         ok: false,
-        error: "No tienes permisos para editar horarios",
+        error: "You do not have permission to edit schedules",
       });
     }
 
-    // buscar horario actual
+    // Find current schedule block
     const { data: horarioActual, error: horarioError } = await supabase
       .from("horarios")
       .select("*")
@@ -165,7 +165,7 @@ const updateHorarioAdmin = async (req, res) => {
     if (horarioError || !horarioActual) {
       return res.status(404).json({
         ok: false,
-        error: "Horario no encontrado",
+        error: "Schedule not found",
       });
     }
 
@@ -184,18 +184,18 @@ const updateHorarioAdmin = async (req, res) => {
     if (!diasValidos.includes(diaFinal)) {
       return res.status(400).json({
         ok: false,
-        error: "dia_semana inválido",
+        error: "Invalid dia_semana value",
       });
     }
 
     if (inicioFinal >= finFinal) {
       return res.status(400).json({
         ok: false,
-        error: "hora_inicio debe ser menor que hora_fin",
+        error: "hora_inicio must be earlier than hora_fin",
       });
     }
 
-    // buscar otros bloques activos del mismo día, excluyendo el actual
+    // Look for other active blocks on the same day, excluding current record
     const { data: horariosExistentes, error: errorExistentes } = await supabase
       .from("horarios")
       .select("*")
@@ -215,7 +215,7 @@ const updateHorarioAdmin = async (req, res) => {
       if (haySolapamiento(inicioFinal, finFinal, horario.hora_inicio, horario.hora_fin)) {
         return res.status(400).json({
           ok: false,
-          error: "El horario se traslapa con otro bloque existente",
+          error: "The schedule overlaps with an existing block",
         });
       }
     }
@@ -264,7 +264,7 @@ const deleteHorarioAdmin = async (req, res) => {
     if (rolUser !== "admin") {
       return res.status(403).json({
         ok: false,
-        error: "No tienes permisos para eliminar horarios",
+        error: "You do not have permission to delete schedules",
       });
     }
 
@@ -286,17 +286,18 @@ const deleteHorarioAdmin = async (req, res) => {
     if (!horarioActual) {
       return res.status(404).json({
         ok: false,
-        error: "Horario no encontrado",
+        error: "Schedule not found",
       });
     }
 
+    
     const { data, error } = await supabase
-      .from("horarios")
-      .update({ activo: false })
-      .eq("id", horarioId)
-      .eq("negocio_id", negocioId)
-      .select("*")
-      .single();
+    .from("horarios")
+    .delete()
+    .eq("id", horarioId)
+    .eq("negocio_id", negocioId)
+    .select("*")
+    .single();
 
     if (error) {
       return res.status(500).json({
@@ -323,4 +324,5 @@ module.exports = {
   createHorarioAdmin,
   updateHorarioAdmin,
   deleteHorarioAdmin,
+  haySolapamiento,
 };

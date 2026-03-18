@@ -2,18 +2,45 @@ const supabase = require('../config/supabase');
 
 const getServicios = async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('servicios')
-      .select('*');
+    const { negocio_id, q, include_business } = req.query;
+
+    let query = supabase
+      .from("servicios")
+      .select(
+        include_business === "true"
+          ? "*, negocios(id, nombre, zona_horaria)"
+          : "*"
+      )
+      .eq("activo", true);
+
+    if (negocio_id) {
+      query = query.eq("negocio_id", negocio_id);
+    }
+
+    if (q && String(q).trim()) {
+      const text = String(q).trim();
+      query = query.or(`nombre.ilike.%${text}%,descripcion.ilike.%${text}%`);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      return res.status(500).json({
+        ok: false,
+        step: "query servicios",
+        error: error.message,
+      });
+    }
 
     return res.json({
       ok: true,
-      data,
+      data: data || [],
+      count: data ? data.length : 0,
     });
   } catch (e) {
     return res.status(500).json({
       ok: false,
-      step: 'exception',
+      step: "exception",
       error: e.message,
     });
   }
@@ -58,7 +85,7 @@ const createServicio = async (req, res) => {
     if (rolUser !== 'admin') {
       return res.status(403).json({
         ok: false,
-        error: 'No tienes permisos para crear servicios',
+        error: 'You do not have permission to create services',
       });
     }
 
@@ -68,6 +95,7 @@ const createServicio = async (req, res) => {
       nombre,
       descripcion,
       duracion_min,
+      buffer_min,
       precio,
       anticipo_tipo,
       anticipo_valor,
@@ -75,27 +103,31 @@ const createServicio = async (req, res) => {
       imagen_url = null,
     } = req.body;
 
-    // Validaciones mínimas
+    // Minimum validations
     if (!nombre || !duracion_min || precio === undefined || !anticipo_tipo) {
       return res.status(400).json({
         ok: false,
-        error: 'Faltan campos requeridos: nombre, duracion_min, precio, anticipo_tipo',
+        error: 'Missing required fields: nombre, duracion_min, precio, anticipo_tipo',
       });
     }
 
     if (!['fijo', 'porcentaje', 'no_requiere'].includes(anticipo_tipo)) {
-      return res.status(400).json({ ok: false, error: 'anticipo_tipo inválido' });
+      return res.status(400).json({ ok: false, error: 'Invalid anticipo_tipo value' });
     }
 
     const dur = Number(duracion_min);
     const pr = Number(precio);
+    const bf = buffer_min === undefined || buffer_min === null ? null : Number(buffer_min);
 
     if (!Number.isFinite(dur) || dur <= 0) {
-      return res.status(400).json({ ok: false, error: 'duracion_min debe ser > 0' });
+      return res.status(400).json({ ok: false, error: 'duracion_min must be greater than 0' });
     }
 
     if (!Number.isFinite(pr) || pr < 0) {
-      return res.status(400).json({ ok: false, error: 'precio debe ser >= 0' });
+      return res.status(400).json({ ok: false, error: 'precio must be greater than or equal to 0' });
+    }
+    if (bf !== null && (!Number.isFinite(bf) || bf < 0)) {
+      return res.status(400).json({ ok: false, error: "buffer_min must be greater than or equal to 0" });
     }
 
     let anticipoFinal = anticipo_valor;
@@ -105,15 +137,15 @@ const createServicio = async (req, res) => {
     } else {
       const av = Number(anticipo_valor);
       if (!Number.isFinite(av)) {
-        return res.status(400).json({ ok: false, error: 'anticipo_valor es requerido' });
+        return res.status(400).json({ ok: false, error: 'anticipo_valor is required' });
       }
 
       if (anticipo_tipo === 'fijo' && av <= 0) {
-        return res.status(400).json({ ok: false, error: 'anticipo_valor debe ser > 0' });
+        return res.status(400).json({ ok: false, error: 'anticipo_valor must be greater than 0' });
       }
 
       if (anticipo_tipo === 'porcentaje' && (av < 1 || av > 100)) {
-        return res.status(400).json({ ok: false, error: 'anticipo_valor debe estar entre 1 y 100' });
+        return res.status(400).json({ ok: false, error: 'anticipo_valor must be between 1 and 100' });
       }
 
       anticipoFinal = av;
@@ -126,6 +158,7 @@ const createServicio = async (req, res) => {
         nombre,
         descripcion: descripcion ?? null,
         duracion_min: dur,
+        buffer_min: bf,
         precio: pr,
         anticipo_tipo,
         anticipo_valor: anticipoFinal,
@@ -165,7 +198,7 @@ const updateServicio = async (req, res) => {
     if (rolUser !== "admin") {
       return res.status(403).json({
         ok: false,
-        error: "No tienes permisos para editar servicios",
+        error: "You do not have permission to edit services",
       });
     }
 
@@ -179,7 +212,7 @@ const updateServicio = async (req, res) => {
     if (servicioError || !servicioActual) {
       return res.status(404).json({
         ok: false,
-        error: "Servicio no encontrado",
+        error: "Service not found",
       });
     }
 
@@ -187,6 +220,7 @@ const updateServicio = async (req, res) => {
       nombre,
       descripcion,
       duracion_min,
+      buffer_min,
       precio,
       anticipo_tipo,
       anticipo_valor,
@@ -200,7 +234,7 @@ const updateServicio = async (req, res) => {
       if (!nombre.trim()) {
         return res.status(400).json({
           ok: false,
-          error: "El nombre no puede estar vacío",
+          error: "Service name cannot be empty",
         });
       }
       updateData.nombre = nombre;
@@ -213,10 +247,21 @@ const updateServicio = async (req, res) => {
       if (!Number.isFinite(dur) || dur <= 0) {
         return res.status(400).json({
           ok: false,
-          error: "duracion_min debe ser mayor a 0",
+          error: "duracion_min must be greater than 0",
         });
       }
       updateData.duracion_min = dur;
+    }
+
+    if (buffer_min !== undefined) {
+      const bf = Number(buffer_min);
+      if (!Number.isFinite(bf) || bf < 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "buffer_min must be greater than or equal to 0",
+        });
+      }
+      updateData.buffer_min = bf;
     }
 
     if (precio !== undefined) {
@@ -224,7 +269,7 @@ const updateServicio = async (req, res) => {
       if (!Number.isFinite(pr) || pr < 0) {
         return res.status(400).json({
           ok: false,
-          error: "precio debe ser mayor o igual a 0",
+          error: "precio must be greater than or equal to 0",
         });
       }
       updateData.precio = pr;
@@ -240,7 +285,7 @@ const updateServicio = async (req, res) => {
       if (!["fijo", "porcentaje", "no_requiere"].includes(tipoFinal)) {
         return res.status(400).json({
           ok: false,
-          error: "anticipo_tipo inválido",
+          error: "Invalid anticipo_tipo value",
         });
       }
 
@@ -254,7 +299,7 @@ const updateServicio = async (req, res) => {
         if (!Number.isFinite(av) || av <= 0) {
           return res.status(400).json({
             ok: false,
-            error: "anticipo_valor debe ser mayor a 0",
+            error: "anticipo_valor must be greater than 0",
           });
         }
 
@@ -267,7 +312,7 @@ const updateServicio = async (req, res) => {
         if (!Number.isFinite(av) || av < 1 || av > 100) {
           return res.status(400).json({
             ok: false,
-            error: "anticipo_valor debe estar entre 1 y 100",
+            error: "anticipo_valor must be between 1 and 100",
           });
         }
 
@@ -279,7 +324,7 @@ const updateServicio = async (req, res) => {
     if (Object.keys(updateData).length === 0) {
       return res.status(400).json({
         ok: false,
-        error: "No se enviaron campos para actualizar",
+        error: "No fields were provided for update",
       });
     }
 
@@ -312,7 +357,7 @@ const updateServicio = async (req, res) => {
 };
 
 
-//delete servicio solo hace un soft delete, no borra por completo de la base de datos
+// Soft delete for services (set activo=false)
 const deleteServicio = async (req, res) => {
   try {
     const rolUser = req.user.rol;
@@ -322,7 +367,7 @@ const deleteServicio = async (req, res) => {
     if (rolUser !== "admin") {
       return res.status(403).json({
         ok: false,
-        error: "No tienes permisos para eliminar servicios",
+        error: "You do not have permission to delete services",
       });
     }
 
@@ -344,7 +389,7 @@ const deleteServicio = async (req, res) => {
     if (!data) {
       return res.status(404).json({
         ok: false,
-        error: "Servicio no encontrado",
+        error: "Service not found",
       });
     }
 

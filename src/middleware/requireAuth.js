@@ -6,13 +6,13 @@ async function requireAuth(req, res, next) {
     const token = header.startsWith("Bearer ") ? header.slice(7) : null;
 
     if (!token) {
-      return res.status(401).json({ ok: false, error: "Falta token Bearer" });
+      return res.status(401).json({ ok: false, error: "Missing Bearer token" });
     }
 
     const { data: userData, error: userError } = await supabase.auth.getUser(token);
 
     if (userError || !userData?.user) {
-      return res.status(401).json({ ok: false, error: "Token inválido o expirado" });
+      return res.status(401).json({ ok: false, error: "Invalid or expired token" });
     }
 
     const authUser = userData.user;
@@ -24,11 +24,11 @@ async function requireAuth(req, res, next) {
       .single();
 
     if (perfilError || !perfil) {
-      return res.status(401).json({ ok: false, error: "Perfil no encontrado en usuarios" });
+      return res.status(401).json({ ok: false, error: "User profile not found" });
     }
 
     if (!perfil.activo) {
-      return res.status(403).json({ ok: false, error: "Usuario inactivo" });
+      return res.status(403).json({ ok: false, error: "Inactive user" });
     }
 
     req.user = perfil;

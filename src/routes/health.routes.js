@@ -21,7 +21,7 @@ router.get("/supabase", async (req, res) => {
 
     return res.json({
       ok: true,
-      message: "Conexión a Supabase OK",
+      message: "Supabase connection OK",
       sample: data,
     });
   } catch (e) {

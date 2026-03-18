@@ -11,8 +11,10 @@ app.use(express.json());
 app.use('/api/negocios', require('./routes/negocios.routes'));
 app.use('/api/servicios', require('./routes/servicios.routes'));
 app.use('/api/horarios', require('./routes/horarios.routes'));
-/*app.use('/api/reservas', require('./routes/reservas.routes'));
-app.use('/api/pagos', require('./routes/pagos.routes')); */
+app.use('/api/reservas', require('./routes/reservas.routes'));
+app.use('/api/bloqueos', require('./routes/bloqueos.routes'));
+app.use('/api/pagos', require('./routes/pagos.routes'));
+app.use('/api/usuarios', require('./routes/usuarios.routes'));
 app.use('/api/health', require('./routes/health.routes'));
 app.use('/api/auth', require('./routes/auth.routes'));
 
