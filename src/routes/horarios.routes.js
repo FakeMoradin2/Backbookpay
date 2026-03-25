@@ -6,11 +6,13 @@ const requireAuth = require('../middleware/requireAuth');
 const {
   getHorariosAdmin,
   createHorarioAdmin,
+  createHorariosBulkAdmin,
   updateHorarioAdmin,
   deleteHorarioAdmin,
 } = require('../controllers/horarios.controllers');
 
 router.get('/admin/horarios', requireAuth, getHorariosAdmin);
+router.post('/admin/horarios/bulk', requireAuth, createHorariosBulkAdmin);
 router.post('/admin/horarios', requireAuth, createHorarioAdmin);
 router.patch('/admin/horarios/:id', requireAuth, updateHorarioAdmin);
 router.delete('/admin/horarios/:id', requireAuth, deleteHorarioAdmin);

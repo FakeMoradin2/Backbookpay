@@ -86,10 +86,26 @@ const register = async (req, res) => {
           error: "Invalid invitation code",
         });
       }
+
+      const emailNormalized = String(email).trim().toLowerCase();
+
+      // 2b) Email already used in app (profiles table)
+      const { data: existingProfile } = await supabase
+        .from("usuarios")
+        .select("id")
+        .ilike("correo", emailNormalized)
+        .maybeSingle();
+
+      if (existingProfile) {
+        return res.status(409).json({
+          ok: false,
+          error: "This email is already registered. Sign in or use a different email.",
+        });
+      }
   
       // 3) Crear usuario en Supabase Auth 
       const { data, error } = await supabase.auth.signUp({
-        email,
+        email: emailNormalized,
         password,
         options: {
           data: { full_name: nombre },
@@ -97,17 +113,25 @@ const register = async (req, res) => {
       });
   
       if (error) {
-        return res.status(400).json({
+        const msg = String(error.message || "").toLowerCase();
+        const duplicate =
+          msg.includes("already") ||
+          msg.includes("registered") ||
+          msg.includes("exists") ||
+          msg.includes("duplicate");
+        return res.status(duplicate ? 409 : 400).json({
           ok: false,
-          error: error.message,
+          error: duplicate
+            ? "This email is already registered. Sign in or use a different email."
+            : error.message,
         });
       }
   
       const userId = data?.user?.id;
       if (!userId) {
-        return res.status(500).json({
+        return res.status(409).json({
           ok: false,
-          error: "Could not get user id after registration",
+          error: "This email is already registered. Sign in or use a different email.",
         });
       }
   

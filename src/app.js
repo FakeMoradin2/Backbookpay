@@ -4,9 +4,23 @@ const cors = require('cors');
 const app = express();
 
 app.use(cors());
+
+// Stripe webhook: must receive raw body (Stripe verifies signature)
+// IMPORTANT: this route must come BEFORE app.use(express.json())
+const { handleWebhook } = require('./controllers/stripe.controllers');
+app.post(
+  '/api/stripe/webhook',
+  express.raw({ type: 'application/json' }),
+  (req, res, next) => {
+    req.body = req.body;
+    handleWebhook(req, res);
+  }
+);
+
 app.use(express.json());
 
-// Rutas
+// Stripe routes (checkout, complete-setup)
+app.use('/api/stripe', require('./routes/stripe.routes'));
 
 app.use('/api/negocios', require('./routes/negocios.routes'));
 app.use('/api/servicios', require('./routes/servicios.routes'));

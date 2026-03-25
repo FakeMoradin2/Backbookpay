@@ -124,7 +124,15 @@ function overlaps(startA, endA, startB, endB) {
   return startA < endB && endA > startB;
 }
 
-function collectDaySlots(dayStart, horarios, bloqueos, reservas, occupiedMinutes, slotStep) {
+function collectDaySlots(
+  dayStart,
+  horarios,
+  bloqueos,
+  reservas,
+  occupiedMinutes,
+  slotStep,
+  minStartTime = null
+) {
   const slots = [];
 
   for (const h of horarios) {
@@ -139,6 +147,10 @@ function collectDaySlots(dayStart, horarios, bloqueos, reservas, occupiedMinutes
     ) {
       const slotStart = toDateAtMinutes(dayStart, current);
       const slotEnd = new Date(slotStart.getTime() + occupiedMinutes * 60 * 1000);
+
+      if (minStartTime && slotStart <= minStartTime) {
+        continue;
+      }
 
       let blocked = false;
 
@@ -213,6 +225,13 @@ const createReservaCliente = async (req, res) => {
       return res.status(400).json({
         ok: false,
         error: "Invalid start datetime",
+      });
+    }
+
+    if (start <= new Date()) {
+      return res.status(400).json({
+        ok: false,
+        error: "Start datetime must be in the future",
       });
     }
 
@@ -486,6 +505,13 @@ const createReservaAdmin = async (req, res) => {
       return res.status(400).json({
         ok: false,
         error: "Invalid start datetime",
+      });
+    }
+
+    if (start <= new Date()) {
+      return res.status(400).json({
+        ok: false,
+        error: "Start datetime must be in the future",
       });
     }
 
@@ -899,13 +925,17 @@ const getDisponibilidadPublic = async (req, res) => {
       });
     }
 
+    const now = new Date();
+    const isToday = now.toDateString() === dayStart.toDateString();
+
     const slots = collectDaySlots(
       dayStart,
       horarios,
       bloqueos || [],
       reservas || [],
       occupiedMinutes,
-      slotStep
+      slotStep,
+      isToday ? now : null
     );
 
     return res.json({
@@ -1054,13 +1084,17 @@ const getFechasDisponiblesPublic = async (req, res) => {
         return rStart >= dayStart && rStart < nextDay;
       });
 
+      const now = new Date();
+      const isToday = now.toDateString() === dayStart.toDateString();
+
       const slots = collectDaySlots(
         dayStart,
         daySchedules,
         bloqueos || [],
         dayReservas,
         occupiedMinutes,
-        slotStep
+        slotStep,
+        isToday ? now : null
       );
 
       if (slots.length > 0) {

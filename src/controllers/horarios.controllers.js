@@ -10,6 +10,48 @@ const haySolapamiento = (inicioA, finA, inicioB, finB) => {
   return inicioA < finB && finA > inicioB;
 };
 
+const ORDEN_DIAS = ["lun", "mar", "mie", "jue", "vie", "sab", "dom"];
+
+/**
+ * Inserts one schedule block. Returns { ok: true, data } or { ok: false, error }.
+ */
+async function insertHorarioNegocio(negocioId, dia_semana, hora_inicio, hora_fin, activo = true) {
+  const { data: horariosExistentes, error: errorExistentes } = await supabase
+    .from("horarios")
+    .select("*")
+    .eq("negocio_id", negocioId)
+    .eq("dia_semana", dia_semana)
+    .eq("activo", true);
+
+  if (errorExistentes) {
+    return { ok: false, error: errorExistentes.message };
+  }
+
+  for (const horario of horariosExistentes || []) {
+    if (haySolapamiento(hora_inicio, hora_fin, horario.hora_inicio, horario.hora_fin)) {
+      return { ok: false, error: "The schedule overlaps with an existing block" };
+    }
+  }
+
+  const { data, error } = await supabase
+    .from("horarios")
+    .insert({
+      negocio_id: negocioId,
+      dia_semana,
+      hora_inicio,
+      hora_fin,
+      activo,
+    })
+    .select("*")
+    .single();
+
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+
+  return { ok: true, data };
+}
+
 const getHorariosAdmin = async (req, res) => {
   try {
     const negocioId = req.user.negocio_id;
@@ -84,53 +126,17 @@ const createHorarioAdmin = async (req, res) => {
       });
     }
 
-    // Fetch active blocks for the same day
-    const { data: horariosExistentes, error: errorExistentes } = await supabase
-      .from("horarios")
-      .select("*")
-      .eq("negocio_id", negocioId)
-      .eq("dia_semana", dia_semana)
-      .eq("activo", true);
-
-    if (errorExistentes) {
-      return res.status(500).json({
+    const result = await insertHorarioNegocio(negocioId, dia_semana, hora_inicio, hora_fin, activo);
+    if (!result.ok) {
+      return res.status(400).json({
         ok: false,
-        error: errorExistentes.message,
-      });
-    }
-
-    // Validate overlaps
-    for (const horario of horariosExistentes || []) {
-      if (haySolapamiento(hora_inicio, hora_fin, horario.hora_inicio, horario.hora_fin)) {
-        return res.status(400).json({
-          ok: false,
-          error: "The schedule overlaps with an existing block",
-        });
-      }
-    }
-
-    const { data, error } = await supabase
-      .from("horarios")
-      .insert({
-        negocio_id: negocioId,
-        dia_semana,
-        hora_inicio,
-        hora_fin,
-        activo,
-      })
-      .select("*")
-      .single();
-
-    if (error) {
-      return res.status(500).json({
-        ok: false,
-        error: error.message,
+        error: result.error,
       });
     }
 
     return res.status(201).json({
       ok: true,
-      data,
+      data: result.data,
     });
   } catch (e) {
     return res.status(500).json({
@@ -255,6 +261,94 @@ const updateHorarioAdmin = async (req, res) => {
   }
 };
 
+/**
+ * Create the same time block on multiple days in one request.
+ * Body: { dias_semana: ["lun","mar",...], hora_inicio, hora_fin, activo? }
+ */
+const createHorariosBulkAdmin = async (req, res) => {
+  try {
+    const rolUser = req.user.rol;
+    const negocioId = req.user.negocio_id;
+
+    if (rolUser !== "admin") {
+      return res.status(403).json({
+        ok: false,
+        error: "You do not have permission to create schedules",
+      });
+    }
+
+    const { dias_semana, hora_inicio, hora_fin, activo = true } = req.body;
+
+    if (!Array.isArray(dias_semana) || dias_semana.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "dias_semana must be a non-empty array of weekday codes",
+      });
+    }
+
+    if (!hora_inicio || !hora_fin) {
+      return res.status(400).json({
+        ok: false,
+        error: "hora_inicio and hora_fin are required",
+      });
+    }
+
+    if (hora_inicio >= hora_fin) {
+      return res.status(400).json({
+        ok: false,
+        error: "hora_inicio must be earlier than hora_fin",
+      });
+    }
+
+    const unique = [...new Set(dias_semana.map((d) => String(d).trim().toLowerCase()))];
+    const invalid = unique.filter((d) => !diasValidos.includes(d));
+    if (invalid.length > 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid dia_semana value(s)",
+      });
+    }
+
+    unique.sort((a, b) => ORDEN_DIAS.indexOf(a) - ORDEN_DIAS.indexOf(b));
+
+    const created = [];
+    const failed = [];
+
+    for (const dia of unique) {
+      const result = await insertHorarioNegocio(negocioId, dia, hora_inicio, hora_fin, activo);
+      if (result.ok) {
+        created.push(result.data);
+      } else {
+        failed.push({ dia_semana: dia, error: result.error });
+      }
+    }
+
+    if (created.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Could not create any schedule block",
+        failed,
+      });
+    }
+
+    return res.status(201).json({
+      ok: true,
+      created,
+      failed: failed.length ? failed : undefined,
+      message:
+        failed.length > 0
+          ? `Created ${created.length} block(s); ${failed.length} day(s) skipped (see failed)`
+          : `Created ${created.length} schedule block(s)`,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      step: "exception",
+      error: e.message,
+    });
+  }
+};
+
 const deleteHorarioAdmin = async (req, res) => {
   try {
     const rolUser = req.user.rol;
@@ -322,6 +416,7 @@ const deleteHorarioAdmin = async (req, res) => {
 module.exports = {
   getHorariosAdmin,
   createHorarioAdmin,
+  createHorariosBulkAdmin,
   updateHorarioAdmin,
   deleteHorarioAdmin,
   haySolapamiento,
