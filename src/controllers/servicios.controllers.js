@@ -1,5 +1,17 @@
 const supabase = require('../config/supabase');
 
+/** Deposit rules (fijo / porcentaje) require Stripe Connect ready to charge online. */
+async function negocioStripeDepositsReady(negocioId) {
+  if (!negocioId) return false;
+  const { data, error } = await supabase
+    .from("negocios")
+    .select("stripe_connect_account_id, stripe_connect_charges_enabled")
+    .eq("id", negocioId)
+    .single();
+  if (error || !data) return false;
+  return !!(data.stripe_connect_account_id && data.stripe_connect_charges_enabled);
+}
+
 const getServicios = async (req, res) => {
   try {
     const { negocio_id, q, include_business } = req.query;
@@ -8,7 +20,7 @@ const getServicios = async (req, res) => {
       .from("servicios")
       .select(
         include_business === "true"
-          ? "*, negocios(id, nombre, zona_horaria)"
+          ? "*, negocios(id, nombre, zona_horaria, imagen_url)"
           : "*"
       )
       .eq("activo", true);
@@ -149,6 +161,17 @@ const createServicio = async (req, res) => {
       }
 
       anticipoFinal = av;
+    }
+
+    if (anticipo_tipo === "fijo" || anticipo_tipo === "porcentaje") {
+      const stripeOk = await negocioStripeDepositsReady(negocioUser);
+      if (!stripeOk) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "Configure Stripe under Payments (connect and enable charges) before requiring a deposit on services.",
+        });
+      }
     }
 
     const { data, error } = await supabase
@@ -318,6 +341,22 @@ const updateServicio = async (req, res) => {
 
         updateData.anticipo_tipo = "porcentaje";
         updateData.anticipo_valor = av;
+      }
+    }
+
+    const effectiveAnticipoTipo =
+      updateData.anticipo_tipo !== undefined
+        ? updateData.anticipo_tipo
+        : servicioActual.anticipo_tipo;
+
+    if (effectiveAnticipoTipo === "fijo" || effectiveAnticipoTipo === "porcentaje") {
+      const stripeOk = await negocioStripeDepositsReady(negocioId);
+      if (!stripeOk) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "Configure Stripe under Payments (connect and enable charges) before requiring a deposit on services.",
+        });
       }
     }
 

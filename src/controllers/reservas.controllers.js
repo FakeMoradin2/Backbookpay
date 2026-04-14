@@ -238,7 +238,9 @@ const createReservaCliente = async (req, res) => {
     // 1) Verify negocio exists and is active
     const { data: negocio, error: negocioError } = await supabase
       .from("negocios")
-      .select("id, activo, duracion_buffer_min")
+      .select(
+        "id, activo, duracion_buffer_min, stripe_connect_account_id, stripe_connect_charges_enabled"
+      )
       .eq("id", negocio_id)
       .eq("activo", true)
       .single();
@@ -437,6 +439,11 @@ const createReservaCliente = async (req, res) => {
       });
     }
 
+    const canPayDepositOnline =
+      totalDeposit > 0 &&
+      !!negocio.stripe_connect_account_id &&
+      !!negocio.stripe_connect_charges_enabled;
+
     return res.status(201).json({
       ok: true,
       data: {
@@ -444,6 +451,8 @@ const createReservaCliente = async (req, res) => {
         servicios: detallesPayload,
         computed_end: end.toISOString(),
         occupied_minutes: totalOccupiedMinutes,
+        deposit_amount: totalDeposit,
+        can_pay_deposit_online: canPayDepositOnline,
       },
     });
   } catch (e) {

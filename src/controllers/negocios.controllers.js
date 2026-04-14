@@ -123,7 +123,7 @@ const updateNegocioAdmin = async (req, res) => {
       correo,
       zona_horaria,
       duracion_buffer_min,
-      imagen
+      imagen_url,
     } = req.body;
 
     const updateData = {};
@@ -133,7 +133,7 @@ const updateNegocioAdmin = async (req, res) => {
     if (correo !== undefined) updateData.correo = correo;
     if (zona_horaria !== undefined) updateData.zona_horaria = zona_horaria;
     if (duracion_buffer_min !== undefined) updateData.duracion_buffer_min = duracion_buffer_min;
-    if (imagen !== undefined) updateData.imagen = imagen;
+    if (imagen_url !== undefined) updateData.imagen_url = imagen_url;
 
     if (Object.keys(updateData).length === 0) {
       return res.status(400).json({

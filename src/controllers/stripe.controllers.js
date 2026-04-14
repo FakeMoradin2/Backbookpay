@@ -17,6 +17,16 @@ function normalizeEnvSecret(raw) {
 const stripeKey = normalizeEnvSecret(process.env.STRIPE_SECRET_KEY);
 const stripe = stripeKey ? new Stripe(stripeKey) : null;
 
+function getStripeCurrency() {
+  return (normalizeEnvSecret(process.env.STRIPE_CURRENCY) || "mxn").toLowerCase();
+}
+
+function platformFeeAmountCents(totalCents) {
+  const pct = Number(process.env.STRIPE_PLATFORM_FEE_PERCENT || "0");
+  if (!Number.isFinite(pct) || pct <= 0) return 0;
+  return Math.min(Math.floor((totalCents * pct) / 100), totalCents - 1);
+}
+
 /**
  * Creates a Stripe Checkout session to purchase an admin account.
  * Receives: { nombre, email }
@@ -93,8 +103,97 @@ const createCheckoutSession = async (req, res) => {
   }
 };
 
+async function syncConnectAccountFromStripe(account) {
+  const id = account?.id;
+  if (!id) return;
+  await supabase
+    .from("negocios")
+    .update({
+      stripe_connect_charges_enabled: !!account.charges_enabled,
+      stripe_connect_details_submitted: !!account.details_submitted,
+    })
+    .eq("stripe_connect_account_id", id);
+}
+
+async function handleDepositSessionCompleted(session) {
+  const reservaId = session.metadata?.reserva_id;
+  if (!reservaId) {
+    throw new Error("Missing reserva_id in session metadata");
+  }
+
+  const paymentOk =
+    session.payment_status === "paid" || session.payment_status === "no_payment_required";
+  if (session.status !== "complete" || !paymentOk) {
+    throw new Error("Deposit payment not complete");
+  }
+
+  const { data: reserva, error: rErr } = await supabase
+    .from("reservas")
+    .select("id, estado, anticipo_calculado, precio_total, negocio_id")
+    .eq("id", reservaId)
+    .single();
+
+  if (rErr || !reserva) {
+    throw new Error("Reservation not found");
+  }
+
+  if (reserva.estado !== "pendiente_pago") {
+    return;
+  }
+
+  const expectedCents = Math.round(Number(reserva.anticipo_calculado) * 100);
+  if (session.amount_total != null && Number(session.amount_total) !== expectedCents) {
+    throw new Error("Payment amount does not match reservation deposit");
+  }
+
+  const monto = Number(reserva.anticipo_calculado);
+  const currency = getStripeCurrency();
+
+  const { data: existingPago } = await supabase
+    .from("pagos")
+    .select("id")
+    .eq("reserva_id", reservaId)
+    .eq("tipo", "anticipo")
+    .eq("estado", "pagado")
+    .maybeSingle();
+
+  if (existingPago) {
+    return;
+  }
+
+  const referencia = session.payment_intent || session.id;
+
+  const { error: pErr } = await supabase.from("pagos").insert({
+    reserva_id: reservaId,
+    tipo: "anticipo",
+    monto,
+    moneda: currency,
+    metodo: "stripe",
+    estado: "pagado",
+    referencia: String(referencia),
+  });
+
+  if (pErr) {
+    throw new Error(pErr.message);
+  }
+
+  const remaining = Math.max(Number(reserva.precio_total || 0) - monto, 0);
+
+  const { error: uErr } = await supabase
+    .from("reservas")
+    .update({
+      estado: "confirmada",
+      saldo_pendiente: remaining,
+    })
+    .eq("id", reservaId);
+
+  if (uErr) {
+    throw new Error(uErr.message);
+  }
+}
+
 /**
- * Stripe webhook. Handles checkout.session.completed to create admin account.
+ * Stripe webhook: admin checkout, deposit checkout, Connect account updates.
  */
 const handleWebhook = async (req, res) => {
   if (!stripe) {
@@ -118,8 +217,19 @@ const handleWebhook = async (req, res) => {
 
   if (event.type === "checkout.session.completed") {
     const session = event.data.object;
+    const metaType = session.metadata?.type;
 
-    if (session.metadata?.type !== "admin_upgrade") {
+    if (metaType === "deposit_payment") {
+      try {
+        await handleDepositSessionCompleted(session);
+      } catch (e) {
+        console.error("Webhook: deposit payment:", e);
+        return res.status(500).json({ ok: false, error: e.message });
+      }
+      return res.json({ ok: true, received: true });
+    }
+
+    if (metaType !== "admin_upgrade") {
       return res.json({ ok: true, received: true });
     }
 
@@ -137,6 +247,17 @@ const handleWebhook = async (req, res) => {
       console.error("Webhook: error creating admin:", e);
       return res.status(500).json({ ok: false, error: e.message });
     }
+
+    return res.json({ ok: true, received: true });
+  }
+
+  if (event.type === "account.updated") {
+    try {
+      await syncConnectAccountFromStripe(event.data.object);
+    } catch (e) {
+      console.error("Webhook: account.updated:", e);
+    }
+    return res.json({ ok: true, received: true });
   }
 
   return res.json({ ok: true, received: true });
@@ -325,8 +446,202 @@ function generateRandomPassword() {
   return result;
 }
 
+/**
+ * Admin: Stripe Connect Express onboarding (receive deposits from clients).
+ */
+const createConnectAccountLink = async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(500).json({ ok: false, error: "Stripe is not configured" });
+    }
+    if (req.user.rol !== "admin") {
+      return res.status(403).json({
+        ok: false,
+        error: "Only business administrators can connect Stripe payouts",
+      });
+    }
+    const negocioId = req.user.negocio_id;
+    if (!negocioId) {
+      return res.status(400).json({ ok: false, error: "No business associated" });
+    }
+
+    const { data: negocio, error: nErr } = await supabase
+      .from("negocios")
+      .select("id, correo, nombre, stripe_connect_account_id")
+      .eq("id", negocioId)
+      .single();
+
+    if (nErr || !negocio) {
+      return res.status(404).json({ ok: false, error: "Business not found" });
+    }
+
+    const frontendUrl = normalizeEnvSecret(process.env.FRONTEND_URL) || "http://localhost:3000";
+    const country = normalizeEnvSecret(process.env.STRIPE_CONNECT_DEFAULT_COUNTRY) || "MX";
+
+    let accountId = negocio.stripe_connect_account_id;
+
+    if (!accountId) {
+      const account = await stripe.accounts.create({
+        type: "express",
+        country,
+        email: negocio.correo || req.user.correo || undefined,
+        capabilities: {
+          card_payments: { requested: true },
+          transfers: { requested: true },
+        },
+        business_profile: {
+          name: negocio.nombre || undefined,
+        },
+        metadata: {
+          negocio_id: String(negocioId),
+        },
+      });
+      accountId = account.id;
+      const { error: upErr } = await supabase
+        .from("negocios")
+        .update({ stripe_connect_account_id: accountId })
+        .eq("id", negocioId);
+      if (upErr) {
+        return res.status(500).json({ ok: false, error: upErr.message });
+      }
+    }
+
+    const accountLink = await stripe.accountLinks.create({
+      account: accountId,
+      refresh_url: `${frontendUrl}/dashboard/payments?connect=refresh`,
+      return_url: `${frontendUrl}/dashboard/payments?connect=return`,
+      type: "account_onboarding",
+    });
+
+    return res.json({ ok: true, url: accountLink.url });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: e.message || "Stripe Connect error",
+    });
+  }
+};
+
+/**
+ * Client: hosted Checkout to pay reservation deposit (Connect destination charge).
+ */
+const createDepositCheckoutSession = async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(500).json({ ok: false, error: "Stripe is not configured" });
+    }
+    if (req.user.rol !== "cliente") {
+      return res.status(403).json({ ok: false, error: "Only clients can pay deposits" });
+    }
+
+    const { reserva_id } = req.body;
+    if (!reserva_id) {
+      return res.status(400).json({ ok: false, error: "reserva_id is required" });
+    }
+
+    const { data: reserva, error: rErr } = await supabase
+      .from("reservas")
+      .select(
+        "id, usuario_id, negocio_id, estado, anticipo_calculado, precio_total"
+      )
+      .eq("id", reserva_id)
+      .single();
+
+    if (rErr || !reserva) {
+      return res.status(404).json({ ok: false, error: "Reservation not found" });
+    }
+
+    if (reserva.usuario_id !== req.user.id) {
+      return res.status(403).json({ ok: false, error: "Not your reservation" });
+    }
+
+    if (reserva.estado !== "pendiente_pago") {
+      return res.status(400).json({
+        ok: false,
+        error: "Reservation does not require this payment",
+      });
+    }
+
+    const deposit = Number(reserva.anticipo_calculado);
+    if (!Number.isFinite(deposit) || deposit <= 0) {
+      return res.status(400).json({ ok: false, error: "No deposit amount for this reservation" });
+    }
+
+    const { data: negocio, error: nErr } = await supabase
+      .from("negocios")
+      .select("id, nombre, stripe_connect_account_id, stripe_connect_charges_enabled, activo")
+      .eq("id", reserva.negocio_id)
+      .single();
+
+    if (nErr || !negocio || !negocio.activo) {
+      return res.status(400).json({ ok: false, error: "Business not available" });
+    }
+
+    if (!negocio.stripe_connect_account_id || !negocio.stripe_connect_charges_enabled) {
+      return res.status(400).json({
+        ok: false,
+        error: "This business is not accepting online deposits yet",
+      });
+    }
+
+    const currency = getStripeCurrency();
+    const amountCents = Math.round(deposit * 100);
+    if (amountCents < 50) {
+      return res.status(400).json({ ok: false, error: "Deposit amount is too small to charge" });
+    }
+
+    const feeCents = platformFeeAmountCents(amountCents);
+    const frontendUrl = normalizeEnvSecret(process.env.FRONTEND_URL) || "http://localhost:3000";
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      payment_method_types: ["card"],
+      customer_email: req.user.correo || undefined,
+      line_items: [
+        {
+          price_data: {
+            currency,
+            unit_amount: amountCents,
+            product_data: {
+              name: "Reservation deposit",
+              description: negocio.nombre ? `Booking at ${negocio.nombre}` : "Booking deposit",
+            },
+          },
+          quantity: 1,
+        },
+      ],
+      payment_intent_data: {
+        application_fee_amount: feeCents > 0 ? feeCents : undefined,
+        transfer_data: {
+          destination: negocio.stripe_connect_account_id,
+        },
+      },
+      metadata: {
+        type: "deposit_payment",
+        reserva_id: String(reserva.id),
+        negocio_id: String(negocio.id),
+      },
+      success_url: `${frontendUrl}/client/reservations?deposit=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${frontendUrl}/client/reservations?deposit=canceled`,
+    });
+
+    return res.json({
+      ok: true,
+      url: session.url,
+      session_id: session.id,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: e.message || "Could not start payment",
+    });
+  }
+};
+
 module.exports = {
   createCheckoutSession,
   handleWebhook,
   completeAdminSetup,
+  createConnectAccountLink,
+  createDepositCheckoutSession,
 };
