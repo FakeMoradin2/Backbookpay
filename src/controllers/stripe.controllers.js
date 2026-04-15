@@ -1,4 +1,5 @@
 const Stripe = require("stripe");
+const { createClient } = require("@supabase/supabase-js");
 const supabase = require("../config/supabase");
 
 /** Trim, strip CR/LF quirks, and optional surrounding quotes from .env values. */
@@ -16,6 +17,16 @@ function normalizeEnvSecret(raw) {
 
 const stripeKey = normalizeEnvSecret(process.env.STRIPE_SECRET_KEY);
 const stripe = stripeKey ? new Stripe(stripeKey) : null;
+
+let supabaseAdmin = null;
+function getSupabaseAdmin() {
+  if (supabaseAdmin) return supabaseAdmin;
+  const url = process.env.SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !serviceKey) return null;
+  supabaseAdmin = createClient(url, serviceKey);
+  return supabaseAdmin;
+}
 
 function getStripeCurrency() {
   return (normalizeEnvSecret(process.env.STRIPE_CURRENCY) || "mxn").toLowerCase();
@@ -487,29 +498,79 @@ const completeAdminSetup = async (req, res) => {
  * @returns {Object} With access_token, refresh_token, etc. if session; or { user_id }
  */
 async function createAdminFromStripePayment(email, nombre, passwordProvided) {
+  const emailNormalized = String(email || "").trim().toLowerCase();
+  const adminClient = getSupabaseAdmin();
+
   const { data: existingUser } = await supabase
     .from("usuarios")
     .select("id, rol")
-    .eq("correo", email)
+    .ilike("correo", emailNormalized)
     .maybeSingle();
 
   let userId;
 
   if (existingUser?.rol === "admin") {
-    throw new Error("An admin account with this email already exists");
+    userId = existingUser.id;
+
+    // Webhook retries (or previously created admin) should be idempotent.
+    if (!passwordProvided) {
+      return { user_id: userId };
+    }
+
+    if (!adminClient) {
+      throw new Error(
+        "Missing SUPABASE_SERVICE_ROLE_KEY to reset password for existing admin account."
+      );
+    }
+
+    const { error: resetErr } = await adminClient.auth.admin.updateUserById(userId, {
+      password: passwordProvided,
+      email_confirm: true,
+    });
+    if (resetErr) {
+      throw new Error(resetErr.message);
+    }
+
+    const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+      email: emailNormalized,
+      password: passwordProvided,
+    });
+    if (signInError || !signInData?.session) {
+      throw new Error(signInError?.message || "Could not sign in after password update");
+    }
+
+    return {
+      access_token: signInData.session.access_token,
+      refresh_token: signInData.session.refresh_token,
+      expires_in: signInData.session.expires_in,
+      token_type: signInData.session.token_type,
+      user_id: signInData.user?.id || userId,
+    };
   }
 
   if (existingUser?.rol === "cliente") {
+    if (passwordProvided) {
+      const { error: verifyErr } = await supabase.auth.signInWithPassword({
+        email: emailNormalized,
+        password: passwordProvided,
+      });
+      if (verifyErr) {
+        throw new Error("Please enter your current account password to confirm the upgrade.");
+      }
+    }
     userId = existingUser.id;
   } else {
     const password = passwordProvided || generateRandomPassword();
-    const { data: authData, error: authError } = await supabase.auth.signUp({
-      email,
+    if (!adminClient) {
+      throw new Error(
+        "Missing SUPABASE_SERVICE_ROLE_KEY in backend environment. It is required to create paid admin users."
+      );
+    }
+    const { data: authData, error: authError } = await adminClient.auth.admin.createUser({
+      email: emailNormalized,
       password,
-      options: {
-        data: { full_name: nombre },
-        emailRedirectTo: undefined,
-      },
+      email_confirm: true,
+      user_metadata: { full_name: nombre },
     });
 
     if (authError) {
@@ -556,14 +617,11 @@ async function createAdminFromStripePayment(email, nombre, passwordProvided) {
 
   if (passwordProvided) {
     const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
-      email,
+      email: emailNormalized,
       password: passwordProvided,
     });
 
     if (signInError) {
-      if (existingUser?.rol === "cliente") {
-        throw new Error("Please enter your current account password to confirm the upgrade.");
-      }
       throw new Error(signInError.message);
     }
 
