@@ -1,4 +1,5 @@
 const supabase = require("../config/supabase");
+const BLOCKING_CONFLICT_STATUSES = ["pendiente_pago", "confirmada"];
 
 // Admin: list all blocks for current business
 const getBloqueosAdmin = async (req, res) => {
@@ -93,6 +94,33 @@ const createBloqueoAdmin = async (req, res) => {
       return res.status(400).json({
         ok: false,
         error: "Invalid end datetime",
+      });
+    }
+
+    const { data: overlappingReservas, error: overlapError } = await supabase
+      .from("reservas")
+      .select("id, inicio_en, fin_en, estado")
+      .eq("negocio_id", negocioId)
+      .in("estado", BLOCKING_CONFLICT_STATUSES)
+      .lt("inicio_en", end.toISOString())
+      .gt("fin_en", start.toISOString())
+      .order("inicio_en", { ascending: true });
+
+    if (overlapError) {
+      return res.status(500).json({
+        ok: false,
+        step: "query overlapping reservas",
+        error: overlapError.message,
+      });
+    }
+
+    if (Array.isArray(overlappingReservas) && overlappingReservas.length > 0) {
+      return res.status(409).json({
+        ok: false,
+        error:
+          "This period already has scheduled reservations. Please reschedule or cancel those reservations before creating the block.",
+        conflicts_count: overlappingReservas.length,
+        conflicts: overlappingReservas,
       });
     }
 

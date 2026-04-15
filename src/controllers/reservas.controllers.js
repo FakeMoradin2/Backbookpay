@@ -8,6 +8,22 @@ const ESTADOS_VALIDOS = [
   "no_show",
   "expirada",
 ];
+const ACTIVE_BOOKING_STATES = ["pendiente_pago", "confirmada"];
+
+/** Upcoming (start >= now) first, soonest first; then past, most recent first. */
+function sortReservasNearestFirst(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return rows || [];
+  const now = Date.now();
+  return [...rows].sort((a, b) => {
+    const aT = new Date(a.inicio_en).getTime();
+    const bT = new Date(b.inicio_en).getTime();
+    const aFuture = aT >= now;
+    const bFuture = bT >= now;
+    if (aFuture !== bFuture) return aFuture ? -1 : 1;
+    if (aFuture) return aT - bT;
+    return bT - aT;
+  });
+}
 
 const WEEKDAY_MAP = ["dom", "lun", "mar", "mie", "jue", "vie", "sab"];
 
@@ -124,6 +140,184 @@ function overlaps(startA, endA, startB, endB) {
   return startA < endB && endA > startB;
 }
 
+async function resolveStaffForNegocio(negocioId, staffId, { requireActive = true } = {}) {
+  if (!staffId) {
+    return {
+      ok: false,
+      status: 400,
+      error: "staff_id is required",
+    };
+  }
+
+  let query = supabase
+    .from("usuarios")
+    .select("id, nombre, rol, negocio_id, activo")
+    .eq("id", staffId)
+    .eq("rol", "staff")
+    .eq("negocio_id", negocioId)
+    .limit(1);
+
+  if (requireActive) {
+    query = query.eq("activo", true);
+  }
+
+  const { data, error } = await query;
+  if (error) {
+    return {
+      ok: false,
+      status: 500,
+      step: "query staff",
+      error: error.message,
+    };
+  }
+
+  const staff = Array.isArray(data) ? data[0] : null;
+  if (!staff) {
+    return {
+      ok: false,
+      status: 400,
+      error: requireActive
+        ? "Selected staff is invalid or inactive for this business"
+        : "Selected staff is invalid for this business",
+    };
+  }
+
+  return { ok: true, staff };
+}
+
+async function listActiveStaffIdsForNegocio(negocioId) {
+  const { data, error } = await supabase
+    .from("usuarios")
+    .select("id")
+    .eq("negocio_id", negocioId)
+    .eq("rol", "staff")
+    .eq("activo", true);
+
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+
+  return {
+    ok: true,
+    ids: Array.isArray(data) ? data.map((x) => x.id) : [],
+  };
+}
+
+/**
+ * Valida que el intervalo [start, end) encaje en horarios, no choque con bloqueos
+ * ni con otras reservas (excluyendo excludeReservaId al reagendar).
+ */
+async function assertSlotAvailable({ negocio_id, staff_id, start, end, excludeReservaId }) {
+  const weekday = WEEKDAY_MAP[start.getDay()];
+  const { data: horariosDia, error: horariosError } = await supabase
+    .from("horarios")
+    .select("*")
+    .eq("negocio_id", negocio_id)
+    .eq("dia_semana", weekday)
+    .eq("activo", true);
+
+  if (horariosError) {
+    return {
+      ok: false,
+      status: 500,
+      step: "query horarios",
+      error: horariosError.message,
+    };
+  }
+
+  const dayStart = new Date(start);
+  dayStart.setHours(0, 0, 0, 0);
+  let fitsSchedule = false;
+
+  for (const h of horariosDia || []) {
+    const blockStart = toDateAtMinutes(dayStart, parseTimeToMinutes(h.hora_inicio));
+    const blockEnd = toDateAtMinutes(dayStart, parseTimeToMinutes(h.hora_fin));
+    if (start >= blockStart && end <= blockEnd) {
+      fitsSchedule = true;
+      break;
+    }
+  }
+
+  if (!fitsSchedule) {
+    return {
+      ok: false,
+      status: 400,
+      error: "Selected start time is outside business schedule",
+    };
+  }
+
+  const { data: bloqueos, error: bloqueosError } = await supabase
+    .from("bloqueos")
+    .select("*")
+    .eq("negocio_id", negocio_id);
+
+  if (bloqueosError) {
+    return {
+      ok: false,
+      status: 500,
+      step: "query bloqueos",
+      error: bloqueosError.message,
+    };
+  }
+
+  for (const b of bloqueos || []) {
+    const bStart = new Date(b.inicio_en);
+    const bEnd = new Date(b.fin_en);
+    if (overlaps(start, end, bStart, bEnd)) {
+      return {
+        ok: false,
+        status: 400,
+        error: "Requested time is blocked",
+      };
+    }
+  }
+
+  const { data: reservasExistentes, error: reservasError } = await supabase
+    .from("reservas")
+    .select("id, inicio_en, fin_en, estado, staff_id")
+    .eq("negocio_id", negocio_id)
+    .neq("estado", "cancelada");
+
+  if (reservasError) {
+    return {
+      ok: false,
+      status: 500,
+      step: "query reservas",
+      error: reservasError.message,
+    };
+  }
+
+  for (const r of reservasExistentes || []) {
+    if (excludeReservaId && r.id === excludeReservaId) continue;
+    const conflictsForStaff =
+      !staff_id || !r.staff_id || r.staff_id === staff_id;
+    if (!conflictsForStaff) continue;
+    const rStart = new Date(r.inicio_en);
+    const rEnd = new Date(r.fin_en);
+    if (overlaps(start, end, rStart, rEnd)) {
+      return {
+        ok: false,
+        status: 400,
+        error: "Requested time overlaps an existing reservation",
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+function hasOverlapForStaff(reservas, targetStaffId, start, end) {
+  for (const r of reservas || []) {
+    const conflictsForStaff =
+      !targetStaffId || !r.staff_id || r.staff_id === targetStaffId;
+    if (!conflictsForStaff) continue;
+    const rStart = new Date(r.inicio_en);
+    const rEnd = new Date(r.fin_en);
+    if (overlaps(start, end, rStart, rEnd)) return true;
+  }
+  return false;
+}
+
 function collectDaySlots(
   dayStart,
   horarios,
@@ -200,6 +394,7 @@ const createReservaCliente = async (req, res) => {
 
     const {
       negocio_id,
+      staff_id,
       servicios, // [{ servicio_id, cantidad }]
       inicio_en,
       nota,
@@ -250,6 +445,33 @@ const createReservaCliente = async (req, res) => {
         ok: false,
         error: "Business not found or inactive",
       });
+    }
+
+    const activeStaffResult = await listActiveStaffIdsForNegocio(negocio_id);
+    if (!activeStaffResult.ok) {
+      return res.status(500).json({
+        ok: false,
+        step: "query active staff",
+        error: activeStaffResult.error,
+      });
+    }
+    const activeStaffIds = activeStaffResult.ids;
+    let selectedStaffId = null;
+    const requestedStaffId = String(staff_id || "").trim() || null;
+    if (activeStaffIds.length > 0) {
+      if (requestedStaffId) {
+        const staffCheck = await resolveStaffForNegocio(negocio_id, requestedStaffId, {
+          requireActive: true,
+        });
+        if (!staffCheck.ok) {
+          return res.status(staffCheck.status || 400).json({
+            ok: false,
+            error: staffCheck.error,
+            step: staffCheck.step,
+          });
+        }
+        selectedStaffId = requestedStaffId;
+      }
     }
 
     // 2) Load services and validate they belong to negocio and are active
@@ -355,7 +577,7 @@ const createReservaCliente = async (req, res) => {
 
     const { data: reservasExistentes, error: reservasError } = await supabase
       .from("reservas")
-      .select("id, inicio_en, fin_en, estado")
+      .select("id, inicio_en, fin_en, estado, staff_id")
       .eq("negocio_id", negocio_id)
       .neq("estado", "cancelada");
 
@@ -367,15 +589,22 @@ const createReservaCliente = async (req, res) => {
       });
     }
 
-    for (const r of reservasExistentes || []) {
-      const rStart = new Date(r.inicio_en);
-      const rEnd = new Date(r.fin_en);
-      if (overlaps(start, end, rStart, rEnd)) {
+    if (!selectedStaffId && activeStaffIds.length > 0) {
+      const firstFreeStaff = activeStaffIds.find(
+        (candidateStaffId) => !hasOverlapForStaff(reservasExistentes || [], candidateStaffId, start, end)
+      );
+      if (!firstFreeStaff) {
         return res.status(400).json({
           ok: false,
-          error: "Requested time overlaps an existing reservation",
+          error: "No staff member is available at that time. Please choose another slot.",
         });
       }
+      selectedStaffId = firstFreeStaff;
+    } else if (hasOverlapForStaff(reservasExistentes || [], selectedStaffId, start, end)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Requested time overlaps an existing reservation",
+      });
     }
 
     // 5) Map services and calculate totals
@@ -398,6 +627,7 @@ const createReservaCliente = async (req, res) => {
       .from("reservas")
       .insert({
         negocio_id,
+        staff_id: selectedStaffId,
         usuario_id: user.id,
         inicio_en: start.toISOString(),
         fin_en: end.toISOString(),
@@ -489,6 +719,7 @@ const createReservaAdmin = async (req, res) => {
       cliente_correo,
       cliente_nombre,
       cliente_telefono,
+      staff_id,
       servicios, // [{ servicio_id, cantidad }]
       inicio_en,
       nota,
@@ -575,6 +806,35 @@ const createReservaAdmin = async (req, res) => {
         ok: false,
         error: "Business not found or inactive",
       });
+    }
+
+    const activeStaffResult = await listActiveStaffIdsForNegocio(negocioId);
+    if (!activeStaffResult.ok) {
+      return res.status(500).json({
+        ok: false,
+        step: "query active staff",
+        error: activeStaffResult.error,
+      });
+    }
+    const activeStaffIds = activeStaffResult.ids;
+    let selectedStaffId = null;
+    const requestedStaffId = String(staff_id || "").trim() || null;
+    if (activeStaffIds.length > 0) {
+      if (user.rol === "staff") {
+        selectedStaffId = user.id;
+      } else if (requestedStaffId) {
+        const staffCheck = await resolveStaffForNegocio(negocioId, requestedStaffId, {
+          requireActive: true,
+        });
+        if (!staffCheck.ok) {
+          return res.status(staffCheck.status || 400).json({
+            ok: false,
+            error: staffCheck.error,
+            step: staffCheck.step,
+          });
+        }
+        selectedStaffId = requestedStaffId;
+      }
     }
 
     const serviceIds = servicios.map((s) => s.servicio_id);
@@ -676,7 +936,7 @@ const createReservaAdmin = async (req, res) => {
 
     const { data: reservasExistentes, error: reservasError } = await supabase
       .from("reservas")
-      .select("id, inicio_en, fin_en, estado")
+      .select("id, inicio_en, fin_en, estado, staff_id")
       .eq("negocio_id", negocioId)
       .neq("estado", "cancelada");
 
@@ -688,15 +948,22 @@ const createReservaAdmin = async (req, res) => {
       });
     }
 
-    for (const r of reservasExistentes || []) {
-      const rStart = new Date(r.inicio_en);
-      const rEnd = new Date(r.fin_en);
-      if (overlaps(start, end, rStart, rEnd)) {
+    if (!selectedStaffId && activeStaffIds.length > 0) {
+      const firstFreeStaff = activeStaffIds.find(
+        (candidateStaffId) => !hasOverlapForStaff(reservasExistentes || [], candidateStaffId, start, end)
+      );
+      if (!firstFreeStaff) {
         return res.status(400).json({
           ok: false,
-          error: "Requested time overlaps an existing reservation",
+          error: "No staff member is available at that time. Please choose another slot.",
         });
       }
+      selectedStaffId = firstFreeStaff;
+    } else if (hasOverlapForStaff(reservasExistentes || [], selectedStaffId, start, end)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Requested time overlaps an existing reservation",
+      });
     }
 
     const detailedServices = servicios.map((s) => {
@@ -725,6 +992,7 @@ const createReservaAdmin = async (req, res) => {
       .from("reservas")
       .insert({
         negocio_id: negocioId,
+        staff_id: selectedStaffId,
         usuario_id: client?.id || null,
         inicio_en: start.toISOString(),
         fin_en: end.toISOString(),
@@ -803,7 +1071,7 @@ const createReservaAdmin = async (req, res) => {
 // Public/client: get available start times for a business date and selected services
 const getDisponibilidadPublic = async (req, res) => {
   try {
-    const { negocio_id, fecha, servicio_ids } = req.query;
+    const { negocio_id, fecha, servicio_ids, staff_id } = req.query;
     const slotStep = Number(req.query.step_min || 15);
 
     if (!negocio_id || !fecha || !servicio_ids) {
@@ -847,6 +1115,29 @@ const getDisponibilidadPublic = async (req, res) => {
         ok: false,
         error: "Business not found or inactive",
       });
+    }
+
+    const selectedStaffId = String(staff_id || "").trim() || null;
+    const activeStaffResult = await listActiveStaffIdsForNegocio(negocio_id);
+    if (!activeStaffResult.ok) {
+      return res.status(500).json({
+        ok: false,
+        step: "query active staff",
+        error: activeStaffResult.error,
+      });
+    }
+    const activeStaffIds = activeStaffResult.ids;
+    if (selectedStaffId) {
+      const staffCheck = await resolveStaffForNegocio(negocio_id, selectedStaffId, {
+        requireActive: true,
+      });
+      if (!staffCheck.ok) {
+        return res.status(staffCheck.status || 400).json({
+          ok: false,
+          error: staffCheck.error,
+          step: staffCheck.step,
+        });
+      }
     }
 
     const { data: servicios, error: serviciosError } = await supabase
@@ -920,7 +1211,7 @@ const getDisponibilidadPublic = async (req, res) => {
 
     const { data: reservas, error: reservasError } = await supabase
       .from("reservas")
-      .select("id, inicio_en, fin_en, estado")
+      .select("id, inicio_en, fin_en, estado, staff_id")
       .eq("negocio_id", negocio_id)
       .neq("estado", "cancelada")
       .gt("fin_en", dayStart.toISOString())
@@ -937,15 +1228,44 @@ const getDisponibilidadPublic = async (req, res) => {
     const now = new Date();
     const isToday = now.toDateString() === dayStart.toDateString();
 
-    const slots = collectDaySlots(
-      dayStart,
-      horarios,
-      bloqueos || [],
-      reservas || [],
-      occupiedMinutes,
-      slotStep,
-      isToday ? now : null
-    );
+    let slots = [];
+    if (selectedStaffId || activeStaffIds.length === 0) {
+      slots = collectDaySlots(
+        dayStart,
+        horarios,
+        bloqueos || [],
+        (reservas || []).filter((r) => {
+          if (!selectedStaffId) return true;
+          return !r.staff_id || r.staff_id === selectedStaffId;
+        }),
+        occupiedMinutes,
+        slotStep,
+        isToday ? now : null
+      );
+    } else {
+      const byStart = new Map();
+      for (const candidateStaffId of activeStaffIds) {
+        const candidateSlots = collectDaySlots(
+          dayStart,
+          horarios,
+          bloqueos || [],
+          (reservas || []).filter(
+            (r) => !r.staff_id || r.staff_id === candidateStaffId
+          ),
+          occupiedMinutes,
+          slotStep,
+          isToday ? now : null
+        );
+        for (const slot of candidateSlots) {
+          if (!byStart.has(slot.start_iso)) {
+            byStart.set(slot.start_iso, slot);
+          }
+        }
+      }
+      slots = Array.from(byStart.values()).sort((a, b) =>
+        a.start_iso < b.start_iso ? -1 : 1
+      );
+    }
 
     return res.json({
       ok: true,
@@ -965,9 +1285,12 @@ const getDisponibilidadPublic = async (req, res) => {
 
 const getFechasDisponiblesPublic = async (req, res) => {
   try {
-    const { negocio_id, servicio_ids } = req.query;
+    const { negocio_id, servicio_ids, staff_id } = req.query;
     const slotStep = Number(req.query.step_min || 15);
-    const daysWindow = Number(req.query.days || 30);
+    const parsedDaysWindow = Number.parseInt(String(req.query.days || "30"), 10);
+    const daysWindow = Number.isNaN(parsedDaysWindow)
+      ? 30
+      : Math.min(365, Math.max(1, parsedDaysWindow));
 
     if (!negocio_id || !servicio_ids) {
       return res.status(400).json({
@@ -1004,6 +1327,29 @@ const getFechasDisponiblesPublic = async (req, res) => {
         ok: false,
         error: "Business not found or inactive",
       });
+    }
+
+    const selectedStaffId = String(staff_id || "").trim() || null;
+    const activeStaffResult = await listActiveStaffIdsForNegocio(negocio_id);
+    if (!activeStaffResult.ok) {
+      return res.status(500).json({
+        ok: false,
+        step: "query active staff",
+        error: activeStaffResult.error,
+      });
+    }
+    const activeStaffIds = activeStaffResult.ids;
+    if (selectedStaffId) {
+      const staffCheck = await resolveStaffForNegocio(negocio_id, selectedStaffId, {
+        requireActive: true,
+      });
+      if (!staffCheck.ok) {
+        return res.status(staffCheck.status || 400).json({
+          ok: false,
+          error: staffCheck.error,
+          step: staffCheck.step,
+        });
+      }
     }
 
     const { data: servicios, error: serviciosError } = await supabase
@@ -1062,7 +1408,7 @@ const getFechasDisponiblesPublic = async (req, res) => {
 
     const { data: reservas, error: reservasError } = await supabase
       .from("reservas")
-      .select("id, inicio_en, fin_en, estado")
+      .select("id, inicio_en, fin_en, estado, staff_id")
       .eq("negocio_id", negocio_id)
       .neq("estado", "cancelada")
       .gt("fin_en", today.toISOString())
@@ -1089,6 +1435,7 @@ const getFechasDisponiblesPublic = async (req, res) => {
       const nextDay = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
 
       const dayReservas = (reservas || []).filter((r) => {
+        if (selectedStaffId && r.staff_id && r.staff_id !== selectedStaffId) return false;
         const rStart = new Date(r.inicio_en);
         return rStart >= dayStart && rStart < nextDay;
       });
@@ -1096,15 +1443,42 @@ const getFechasDisponiblesPublic = async (req, res) => {
       const now = new Date();
       const isToday = now.toDateString() === dayStart.toDateString();
 
-      const slots = collectDaySlots(
-        dayStart,
-        daySchedules,
-        bloqueos || [],
-        dayReservas,
-        occupiedMinutes,
-        slotStep,
-        isToday ? now : null
-      );
+      let slots = [];
+      if (selectedStaffId || activeStaffIds.length === 0) {
+        slots = collectDaySlots(
+          dayStart,
+          daySchedules,
+          bloqueos || [],
+          dayReservas,
+          occupiedMinutes,
+          slotStep,
+          isToday ? now : null
+        );
+      } else {
+        const byStart = new Map();
+        for (const candidateStaffId of activeStaffIds) {
+          const candidateDayReservas = (reservas || []).filter((r) => {
+            if (r.staff_id && r.staff_id !== candidateStaffId) return false;
+            const rStart = new Date(r.inicio_en);
+            return rStart >= dayStart && rStart < nextDay;
+          });
+          const candidateSlots = collectDaySlots(
+            dayStart,
+            daySchedules,
+            bloqueos || [],
+            candidateDayReservas,
+            occupiedMinutes,
+            slotStep,
+            isToday ? now : null
+          );
+          for (const slot of candidateSlots) {
+            if (!byStart.has(slot.start_iso)) {
+              byStart.set(slot.start_iso, slot);
+            }
+          }
+        }
+        slots = Array.from(byStart.values());
+      }
 
       if (slots.length > 0) {
         const isoDate = dayStart.toISOString().slice(0, 10);
@@ -1148,7 +1522,7 @@ const getReservasCliente = async (req, res) => {
       .from("reservas")
       .select("*, reserva_servicios(*), negocios(nombre)")
       .eq("usuario_id", user.id)
-      .order("inicio_en", { ascending: false });
+      .neq("estado", "cancelada");
 
     if (error) {
       return res.status(500).json({
@@ -1158,10 +1532,12 @@ const getReservasCliente = async (req, res) => {
       });
     }
 
+    const sorted = sortReservasNearestFirst(data || []);
+
     return res.json({
       ok: true,
-      data: data || [],
-      count: data ? data.length : 0,
+      data: sorted,
+      count: sorted.length,
     });
   } catch (e) {
     return res.status(500).json({
@@ -1196,9 +1572,8 @@ const getReservasNegocio = async (req, res) => {
 
     let query = supabase
       .from("reservas")
-      .select("*, usuarios(nombre), reserva_servicios(*), pagos(*)")
-      .eq("negocio_id", negocioId)
-      .order("inicio_en", { ascending: false });
+      .select("*, usuarios(nombre, correo, telefono), reserva_servicios(*), pagos(*)")
+      .eq("negocio_id", negocioId);
 
     if (from) {
       query = query.gte("inicio_en", from);
@@ -1220,10 +1595,12 @@ const getReservasNegocio = async (req, res) => {
       });
     }
 
+    const sorted = sortReservasNearestFirst(data || []);
+
     return res.json({
       ok: true,
-      data: data || [],
-      count: data ? data.length : 0,
+      data: sorted,
+      count: sorted.length,
     });
   } catch (e) {
     return res.status(500).json({
@@ -1340,25 +1717,514 @@ const cancelReservaCliente = async (req, res) => {
       });
     }
 
-    const { data, error } = await supabase
-      .from("reservas")
-      .update({ estado: "cancelada" })
-      .eq("id", reservaId)
-      .eq("usuario_id", user.id)
-      .select("*")
-      .single();
+    const { error: delDetErr } = await supabase
+      .from("reserva_servicios")
+      .delete()
+      .eq("reserva_id", reservaId);
 
-    if (error) {
+    if (delDetErr) {
       return res.status(500).json({
         ok: false,
-        step: "update reserva cancel",
-        error: error.message,
+        step: "delete reserva_servicios cancel",
+        error: delDetErr.message,
+      });
+    }
+
+    const { error: delPagosErr } = await supabase.from("pagos").delete().eq("reserva_id", reservaId);
+
+    if (delPagosErr) {
+      return res.status(500).json({
+        ok: false,
+        step: "delete pagos cancel",
+        error: delPagosErr.message,
+      });
+    }
+
+    const { error: delResErr } = await supabase
+      .from("reservas")
+      .delete()
+      .eq("id", reservaId)
+      .eq("usuario_id", user.id);
+
+    if (delResErr) {
+      return res.status(500).json({
+        ok: false,
+        step: "delete reserva cancel",
+        error: delResErr.message,
       });
     }
 
     return res.json({
       ok: true,
-      data,
+      deleted: true,
+      id: reservaId,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      step: "exception",
+      error: e.message,
+    });
+  }
+};
+
+const RESCHEDULE_ALLOWED_ESTADOS = ["pendiente_pago", "confirmada"];
+
+async function loadReservaServiceRowsForDuration(reservaId, negocioId) {
+  const { data: detalles, error: detErr } = await supabase
+    .from("reserva_servicios")
+    .select("servicio_id, cantidad")
+    .eq("reserva_id", reservaId);
+
+  if (detErr) {
+    return { error: detErr.message };
+  }
+  if (!detalles || detalles.length === 0) {
+    return { error: "Reservation has no services" };
+  }
+
+  const servicioIds = [...new Set(detalles.map((d) => d.servicio_id))];
+  const { data: serviciosDb, error: servErr } = await supabase
+    .from("servicios")
+    .select("*")
+    .in("id", servicioIds)
+    .eq("negocio_id", negocioId)
+    .eq("activo", true);
+
+  if (servErr) {
+    return { error: servErr.message };
+  }
+  if (!serviciosDb || serviciosDb.length !== servicioIds.length) {
+    return { error: "Could not load services for this reservation" };
+  }
+
+  const selectedServiceRows = detalles.map((d) => {
+    const row = serviciosDb.find((x) => x.id === d.servicio_id);
+    return {
+      ...row,
+      cantidad: d.cantidad ?? 1,
+    };
+  });
+
+  return { selectedServiceRows };
+}
+
+const reagendarReservaCliente = async (req, res) => {
+  try {
+    const user = req.user;
+    const reservaId = req.params.id;
+    const { inicio_en } = req.body;
+
+    if (user.rol !== "cliente") {
+      return res.status(403).json({
+        ok: false,
+        error: "Only clients can reschedule their reservations",
+      });
+    }
+
+    if (!inicio_en) {
+      return res.status(400).json({
+        ok: false,
+        error: "Start datetime is required",
+      });
+    }
+
+    const start = new Date(inicio_en);
+    if (Number.isNaN(start.getTime())) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid start datetime",
+      });
+    }
+
+    if (start <= new Date()) {
+      return res.status(400).json({
+        ok: false,
+        error: "Start datetime must be in the future",
+      });
+    }
+
+    const { data: reserva, error: reservaError } = await supabase
+      .from("reservas")
+      .select("*")
+      .eq("id", reservaId)
+      .eq("usuario_id", user.id)
+      .single();
+
+    if (reservaError || !reserva) {
+      return res.status(404).json({
+        ok: false,
+        error: "Reservation not found",
+      });
+    }
+
+    if (!RESCHEDULE_ALLOWED_ESTADOS.includes(reserva.estado)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Reservation cannot be rescheduled in its current status",
+      });
+    }
+
+    const { data: negocio, error: negocioError } = await supabase
+      .from("negocios")
+      .select("id, activo, duracion_buffer_min")
+      .eq("id", reserva.negocio_id)
+      .eq("activo", true)
+      .single();
+
+    if (negocioError || !negocio) {
+      return res.status(404).json({
+        ok: false,
+        error: "Business not found or inactive",
+      });
+    }
+
+    const loaded = await loadReservaServiceRowsForDuration(reservaId, reserva.negocio_id);
+    if (loaded.error) {
+      return res.status(400).json({
+        ok: false,
+        error: loaded.error,
+      });
+    }
+
+    const totalOccupiedMinutes = computeTotalOccupiedMinutes(
+      loaded.selectedServiceRows,
+      Number(negocio.duracion_buffer_min || 0)
+    );
+    const end = new Date(start.getTime() + totalOccupiedMinutes * 60 * 1000);
+
+    const slotCheck = await assertSlotAvailable({
+      negocio_id: reserva.negocio_id,
+      staff_id: reserva.staff_id || null,
+      start,
+      end,
+      excludeReservaId: reservaId,
+    });
+
+    if (!slotCheck.ok) {
+      return res.status(slotCheck.status || 400).json({
+        ok: false,
+        error: slotCheck.error,
+        step: slotCheck.step,
+      });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from("reservas")
+      .update({
+        inicio_en: start.toISOString(),
+        fin_en: end.toISOString(),
+      })
+      .eq("id", reservaId)
+      .eq("usuario_id", user.id)
+      .select("*")
+      .single();
+
+    if (updateError) {
+      return res.status(500).json({
+        ok: false,
+        step: "update reserva reagendar",
+        error: updateError.message,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      data: updated,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      step: "exception",
+      error: e.message,
+    });
+  }
+};
+
+const reagendarReservaAdmin = async (req, res) => {
+  try {
+    const user = req.user;
+    const reservaId = req.params.id;
+    const { inicio_en, staff_id } = req.body;
+
+    if (!["admin", "staff"].includes(user.rol)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Only admin or staff can reschedule reservations",
+      });
+    }
+
+    const negocioId = user.negocio_id;
+    if (!negocioId) {
+      return res.status(400).json({
+        ok: false,
+        error: "User has no business associated",
+      });
+    }
+
+    if (!inicio_en) {
+      return res.status(400).json({
+        ok: false,
+        error: "Start datetime is required",
+      });
+    }
+
+    const start = new Date(inicio_en);
+    if (Number.isNaN(start.getTime())) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid start datetime",
+      });
+    }
+
+    if (start <= new Date()) {
+      return res.status(400).json({
+        ok: false,
+        error: "Start datetime must be in the future",
+      });
+    }
+
+    const { data: reserva, error: reservaError } = await supabase
+      .from("reservas")
+      .select("*")
+      .eq("id", reservaId)
+      .eq("negocio_id", negocioId)
+      .single();
+
+    if (reservaError || !reserva) {
+      return res.status(404).json({
+        ok: false,
+        error: "Reservation not found for this business",
+      });
+    }
+
+    if (!RESCHEDULE_ALLOWED_ESTADOS.includes(reserva.estado)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Reservation cannot be rescheduled in its current status",
+      });
+    }
+
+    const { data: negocio, error: negocioError } = await supabase
+      .from("negocios")
+      .select("id, activo, duracion_buffer_min")
+      .eq("id", negocioId)
+      .eq("activo", true)
+      .single();
+
+    if (negocioError || !negocio) {
+      return res.status(404).json({
+        ok: false,
+        error: "Business not found or inactive",
+      });
+    }
+
+    const loaded = await loadReservaServiceRowsForDuration(reservaId, negocioId);
+    if (loaded.error) {
+      return res.status(400).json({
+        ok: false,
+        error: loaded.error,
+      });
+    }
+
+    const totalOccupiedMinutes = computeTotalOccupiedMinutes(
+      loaded.selectedServiceRows,
+      Number(negocio.duracion_buffer_min || 0)
+    );
+    const end = new Date(start.getTime() + totalOccupiedMinutes * 60 * 1000);
+
+    const activeStaffResult = await listActiveStaffIdsForNegocio(negocioId);
+    if (!activeStaffResult.ok) {
+      return res.status(500).json({
+        ok: false,
+        step: "query active staff",
+        error: activeStaffResult.error,
+      });
+    }
+    const activeStaffIds = activeStaffResult.ids;
+
+    let targetStaffId = reserva.staff_id || null;
+    if (user.rol === "staff") {
+      targetStaffId = user.id;
+    } else if (staff_id !== undefined) {
+      targetStaffId = String(staff_id || "").trim() || null;
+    }
+
+    if (!targetStaffId && activeStaffIds.length > 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "staff_id is required to reschedule this reservation",
+      });
+    }
+
+    if (targetStaffId) {
+      const staffCheck = await resolveStaffForNegocio(negocioId, targetStaffId, {
+        requireActive: true,
+      });
+      if (!staffCheck.ok) {
+        return res.status(staffCheck.status || 400).json({
+          ok: false,
+          error: staffCheck.error,
+          step: staffCheck.step,
+        });
+      }
+    }
+
+    const slotCheck = await assertSlotAvailable({
+      negocio_id: negocioId,
+      staff_id: targetStaffId,
+      start,
+      end,
+      excludeReservaId: reservaId,
+    });
+
+    if (!slotCheck.ok) {
+      return res.status(slotCheck.status || 400).json({
+        ok: false,
+        error: slotCheck.error,
+        step: slotCheck.step,
+      });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from("reservas")
+      .update({
+        staff_id: targetStaffId,
+        inicio_en: start.toISOString(),
+        fin_en: end.toISOString(),
+      })
+      .eq("id", reservaId)
+      .eq("negocio_id", negocioId)
+      .select("*")
+      .single();
+
+    if (updateError) {
+      return res.status(500).json({
+        ok: false,
+        step: "update reserva reagendar admin",
+        error: updateError.message,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      data: updated,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      step: "exception",
+      error: e.message,
+    });
+  }
+};
+
+const reassignReservaStaffAdmin = async (req, res) => {
+  try {
+    const user = req.user;
+    const reservaId = req.params.id;
+    const requestedStaffId = String(req.body.staff_id || "").trim();
+
+    if (!["admin", "staff"].includes(user.rol)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Only admin or staff can reassign reservation staff",
+      });
+    }
+
+    const negocioId = user.negocio_id;
+    if (!negocioId) {
+      return res.status(400).json({
+        ok: false,
+        error: "User has no business associated",
+      });
+    }
+
+    if (!requestedStaffId) {
+      return res.status(400).json({
+        ok: false,
+        error: "staff_id is required",
+      });
+    }
+
+    if (user.rol === "staff" && requestedStaffId !== user.id) {
+      return res.status(403).json({
+        ok: false,
+        error: "Staff can only assign reservations to themselves",
+      });
+    }
+
+    const { data: reserva, error: reservaError } = await supabase
+      .from("reservas")
+      .select("*")
+      .eq("id", reservaId)
+      .eq("negocio_id", negocioId)
+      .single();
+
+    if (reservaError || !reserva) {
+      return res.status(404).json({
+        ok: false,
+        error: "Reservation not found for this business",
+      });
+    }
+
+    if (!RESCHEDULE_ALLOWED_ESTADOS.includes(reserva.estado)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Reservation cannot be reassigned in its current status",
+      });
+    }
+
+    const staffCheck = await resolveStaffForNegocio(negocioId, requestedStaffId, {
+      requireActive: true,
+    });
+    if (!staffCheck.ok) {
+      return res.status(staffCheck.status || 400).json({
+        ok: false,
+        error: staffCheck.error,
+        step: staffCheck.step,
+      });
+    }
+
+    const start = new Date(reserva.inicio_en);
+    const end = new Date(reserva.fin_en);
+    const slotCheck = await assertSlotAvailable({
+      negocio_id: negocioId,
+      staff_id: requestedStaffId,
+      start,
+      end,
+      excludeReservaId: reservaId,
+    });
+
+    if (!slotCheck.ok) {
+      return res.status(slotCheck.status || 400).json({
+        ok: false,
+        error: slotCheck.error,
+        step: slotCheck.step,
+      });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from("reservas")
+      .update({
+        staff_id: requestedStaffId,
+      })
+      .eq("id", reservaId)
+      .eq("negocio_id", negocioId)
+      .select("*")
+      .single();
+
+    if (updateError) {
+      return res.status(500).json({
+        ok: false,
+        step: "update reserva staff",
+        error: updateError.message,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      data: updated,
     });
   } catch (e) {
     return res.status(500).json({
@@ -1378,6 +2244,9 @@ module.exports = {
   getReservasNegocio,
   updateReservaEstado,
   cancelReservaCliente,
+  reagendarReservaCliente,
+  reagendarReservaAdmin,
+  reassignReservaStaffAdmin,
   calculateTotals,
   mapServiceDeposit,
   overlaps,

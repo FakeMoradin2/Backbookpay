@@ -1,5 +1,11 @@
 const supabase = require('../config/supabase');
 
+function getEmailRedirectTo() {
+  const frontendUrl = String(process.env.FRONTEND_URL || "").trim();
+  if (!frontendUrl) return undefined;
+  return `${frontendUrl.replace(/\/+$/, "")}/auth/callback`;
+}
+
 
 //funcion de login
 const login = async (req, res) => {
@@ -104,11 +110,14 @@ const register = async (req, res) => {
       }
   
       // 3) Crear usuario en Supabase Auth 
+      const emailRedirectTo = getEmailRedirectTo();
+
       const { data, error } = await supabase.auth.signUp({
         email: emailNormalized,
         password,
         options: {
           data: { full_name: nombre },
+          ...(emailRedirectTo ? { emailRedirectTo } : {}),
         },
       });
   
