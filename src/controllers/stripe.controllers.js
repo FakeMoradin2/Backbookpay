@@ -218,6 +218,11 @@ async function handleDepositSessionCompleted(session) {
   if (uErr) {
     throw new Error(uErr.message);
   }
+
+  return {
+    reserva_id: reservaId,
+    estado: "confirmada",
+  };
 }
 
 async function deleteReservationCascade(reservaId) {
@@ -688,6 +693,74 @@ const syncConnectStatusAdmin = async (req, res) => {
   }
 };
 
+const verifyDepositCheckoutSessionCliente = async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(500).json({ ok: false, error: "Stripe is not configured" });
+    }
+    if (req.user.rol !== "cliente") {
+      return res.status(403).json({ ok: false, error: "Only clients can verify deposit payments" });
+    }
+
+    const sessionId = String(req.body?.session_id || "").trim();
+    if (!sessionId) {
+      return res.status(400).json({ ok: false, error: "session_id is required" });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (!session) {
+      return res.status(404).json({ ok: false, error: "Checkout session not found" });
+    }
+
+    if (session.metadata?.type !== "deposit_payment") {
+      return res.status(400).json({ ok: false, error: "Session is not a deposit payment" });
+    }
+
+    const reservaId = String(session.metadata?.reserva_id || "");
+    if (!reservaId) {
+      return res.status(400).json({ ok: false, error: "Session has no reserva_id metadata" });
+    }
+
+    const { data: reserva, error: reservaErr } = await supabase
+      .from("reservas")
+      .select("id, usuario_id, estado")
+      .eq("id", reservaId)
+      .maybeSingle();
+
+    if (reservaErr) {
+      return res.status(500).json({ ok: false, error: reservaErr.message });
+    }
+    if (!reserva || reserva.usuario_id !== req.user.id) {
+      return res.status(404).json({ ok: false, error: "Reservation not found for this user" });
+    }
+
+    const paymentOk =
+      session.payment_status === "paid" || session.payment_status === "no_payment_required";
+    if (session.status !== "complete" || !paymentOk) {
+      return res.status(409).json({
+        ok: false,
+        error: "Payment is not completed yet",
+        status: session.status,
+        payment_status: session.payment_status,
+      });
+    }
+
+    await handleDepositSessionCompleted(session);
+
+    return res.json({
+      ok: true,
+      verified: true,
+      reserva_id: reservaId,
+      status: "confirmada",
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: e.message || "Could not verify deposit checkout session",
+    });
+  }
+};
+
 const cancelPendingDepositReservationCliente = async (req, res) => {
   try {
     if (req.user.rol !== "cliente") {
@@ -846,6 +919,7 @@ module.exports = {
   completeAdminSetup,
   createConnectAccountLink,
   syncConnectStatusAdmin,
+  verifyDepositCheckoutSessionCliente,
   cancelPendingDepositReservationCliente,
   createDepositCheckoutSession,
 };
