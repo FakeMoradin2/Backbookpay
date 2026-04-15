@@ -220,6 +220,63 @@ async function handleDepositSessionCompleted(session) {
   }
 }
 
+async function deleteReservationCascade(reservaId) {
+  const { error: detErr } = await supabase
+    .from("reserva_servicios")
+    .delete()
+    .eq("reserva_id", reservaId);
+  if (detErr) throw new Error(detErr.message);
+
+  const { error: pagosErr } = await supabase
+    .from("pagos")
+    .delete()
+    .eq("reserva_id", reservaId);
+  if (pagosErr) throw new Error(pagosErr.message);
+
+  const { error: reservaErr } = await supabase
+    .from("reservas")
+    .delete()
+    .eq("id", reservaId);
+  if (reservaErr) throw new Error(reservaErr.message);
+}
+
+async function cleanupPendingDepositReservation(reservaId) {
+  if (!reservaId) return { cleaned: false, skipped: true };
+
+  const { data: reserva, error: rErr } = await supabase
+    .from("reservas")
+    .select("id, estado")
+    .eq("id", reservaId)
+    .maybeSingle();
+
+  if (rErr) {
+    throw new Error(rErr.message);
+  }
+  if (!reserva) {
+    return { cleaned: false, skipped: true };
+  }
+  if (reserva.estado !== "pendiente_pago") {
+    return { cleaned: false, skipped: true };
+  }
+
+  const { data: paidPago, error: paidErr } = await supabase
+    .from("pagos")
+    .select("id")
+    .eq("reserva_id", reservaId)
+    .eq("estado", "pagado")
+    .maybeSingle();
+
+  if (paidErr) {
+    throw new Error(paidErr.message);
+  }
+  if (paidPago) {
+    return { cleaned: false, skipped: true };
+  }
+
+  await deleteReservationCascade(reservaId);
+  return { cleaned: true };
+}
+
 /**
  * Stripe webhook: admin checkout, deposit checkout, Connect account updates.
  */
@@ -276,6 +333,24 @@ const handleWebhook = async (req, res) => {
       return res.status(500).json({ ok: false, error: e.message });
     }
 
+    return res.json({ ok: true, received: true });
+  }
+
+  if (
+    event.type === "checkout.session.expired" ||
+    event.type === "checkout.session.async_payment_failed"
+  ) {
+    const session = event.data.object;
+    const metaType = session?.metadata?.type;
+    if (metaType !== "deposit_payment") {
+      return res.json({ ok: true, received: true });
+    }
+    try {
+      await cleanupPendingDepositReservation(session?.metadata?.reserva_id);
+    } catch (e) {
+      console.error(`Webhook: ${event.type}:`, e);
+      return res.status(500).json({ ok: false, error: e.message || "Could not clean pending reservation" });
+    }
     return res.json({ ok: true, received: true });
   }
 
@@ -613,6 +688,40 @@ const syncConnectStatusAdmin = async (req, res) => {
   }
 };
 
+const cancelPendingDepositReservationCliente = async (req, res) => {
+  try {
+    if (req.user.rol !== "cliente") {
+      return res.status(403).json({ ok: false, error: "Only clients can cancel pending deposits" });
+    }
+
+    const reservaId = String(req.body?.reserva_id || "").trim();
+    if (!reservaId) {
+      return res.status(400).json({ ok: false, error: "reserva_id is required" });
+    }
+
+    const { data: reserva, error: rErr } = await supabase
+      .from("reservas")
+      .select("id, usuario_id, estado")
+      .eq("id", reservaId)
+      .maybeSingle();
+
+    if (rErr) {
+      return res.status(500).json({ ok: false, error: rErr.message });
+    }
+    if (!reserva || reserva.usuario_id !== req.user.id) {
+      return res.status(404).json({ ok: false, error: "Reservation not found" });
+    }
+
+    const result = await cleanupPendingDepositReservation(reservaId);
+    return res.json({ ok: true, ...result });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: e.message || "Could not cancel pending deposit reservation",
+    });
+  }
+};
+
 /**
  * Client: hosted Checkout to pay reservation deposit (Connect destination charge).
  */
@@ -713,7 +822,9 @@ const createDepositCheckoutSession = async (req, res) => {
         negocio_id: String(negocio.id),
       },
       success_url: `${frontendUrl}/client/reservations?deposit=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${frontendUrl}/client/reservations?deposit=canceled`,
+      cancel_url: `${frontendUrl}/client/reservations?deposit=canceled&reserva_id=${encodeURIComponent(
+        reserva.id
+      )}`,
     });
 
     return res.json({
@@ -735,5 +846,6 @@ module.exports = {
   completeAdminSetup,
   createConnectAccountLink,
   syncConnectStatusAdmin,
+  cancelPendingDepositReservationCliente,
   createDepositCheckoutSession,
 };
