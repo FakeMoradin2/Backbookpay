@@ -113,6 +113,9 @@ const createCheckoutSession = async (req, res) => {
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
+      // Keep Stripe Checkout clean for 100%-off coupons:
+      // only ask for payment details when a payment method is actually required.
+      payment_method_collection: "if_required",
       payment_method_types: ["card"],
       line_items: [
         {
