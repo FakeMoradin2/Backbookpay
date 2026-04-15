@@ -28,6 +28,23 @@ function getSupabaseAdmin() {
   return supabaseAdmin;
 }
 
+async function findAuthUserIdByEmail(adminClient, emailNormalized) {
+  if (!adminClient || !emailNormalized) return null;
+  const perPage = 200;
+  const maxPages = 15;
+  for (let page = 1; page <= maxPages; page += 1) {
+    const { data, error } = await adminClient.auth.admin.listUsers({ page, perPage });
+    if (error) throw new Error(error.message);
+    const users = data?.users || [];
+    const match = users.find(
+      (u) => String(u.email || "").trim().toLowerCase() === emailNormalized
+    );
+    if (match?.id) return match.id;
+    if (users.length < perPage) break;
+  }
+  return null;
+}
+
 function getStripeCurrency() {
   return (normalizeEnvSecret(process.env.STRIPE_CURRENCY) || "mxn").toLowerCase();
 }
@@ -574,15 +591,43 @@ async function createAdminFromStripePayment(email, nombre, passwordProvided) {
     });
 
     if (authError) {
-      if (authError.message?.includes("already been registered")) {
+      const msg = String(authError.message || "").toLowerCase();
+      const duplicate =
+        msg.includes("already") ||
+        msg.includes("registered") ||
+        msg.includes("exists") ||
+        msg.includes("duplicate");
+
+      if (!duplicate) {
+        throw new Error(authError.message);
+      }
+
+      // Recovery path: Auth user exists already, but app profile may be missing/out-of-sync.
+      const recoveredUserId = await findAuthUserIdByEmail(adminClient, emailNormalized);
+      if (!recoveredUserId) {
         throw new Error("This email is already registered. Sign in or use a different email.");
       }
-      throw new Error(authError.message);
-    }
 
-    userId = authData?.user?.id;
-    if (!userId) {
-      throw new Error("Could not get user ID");
+      if (passwordProvided) {
+        const { error: updateAuthErr } = await adminClient.auth.admin.updateUserById(
+          recoveredUserId,
+          {
+            password: passwordProvided,
+            email_confirm: true,
+            user_metadata: { full_name: nombre },
+          }
+        );
+        if (updateAuthErr) {
+          throw new Error(updateAuthErr.message);
+        }
+      }
+
+      userId = recoveredUserId;
+    } else {
+      userId = authData?.user?.id;
+      if (!userId) {
+        throw new Error("Could not get user ID");
+      }
     }
   }
 
@@ -601,15 +646,20 @@ async function createAdminFromStripePayment(email, nombre, passwordProvided) {
     throw new Error(negocioError.message);
   }
 
-  const { error: perfilError } = await supabase
+  const dbClient = adminClient || supabase;
+  const { error: perfilError } = await dbClient
     .from("usuarios")
-    .update({
-      nombre,
-      rol: "admin",
-      negocio_id: negocioCreado.id,
-      activo: true,
-    })
-    .eq("id", userId);
+    .upsert(
+      {
+        id: userId,
+        nombre,
+        correo: emailNormalized,
+        rol: "admin",
+        negocio_id: negocioCreado.id,
+        activo: true,
+      },
+      { onConflict: "id" }
+    );
 
   if (perfilError) {
     throw new Error(perfilError.message);
