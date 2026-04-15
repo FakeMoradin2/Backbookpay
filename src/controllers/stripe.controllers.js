@@ -59,6 +59,28 @@ const createCheckoutSession = async (req, res) => {
       });
     }
 
+    // Guardrail: do not allow paying twice for an email that is already an admin.
+    const { data: existingAdminRows, error: existingAdminError } = await supabase
+      .from("usuarios")
+      .select("id")
+      .eq("rol", "admin")
+      .ilike("correo", emailTrim)
+      .limit(1);
+
+    if (existingAdminError) {
+      return res.status(500).json({
+        ok: false,
+        error: existingAdminError.message,
+      });
+    }
+
+    if (Array.isArray(existingAdminRows) && existingAdminRows.length > 0) {
+      return res.status(409).json({
+        ok: false,
+        error: "This email is already registered as an admin. Sign in instead of paying again.",
+      });
+    }
+
     const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
 
     const session = await stripe.checkout.sessions.create({
