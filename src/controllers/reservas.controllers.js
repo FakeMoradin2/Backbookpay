@@ -26,6 +26,15 @@ function sortReservasNearestFirst(rows) {
 }
 
 const WEEKDAY_MAP = ["dom", "lun", "mar", "mie", "jue", "vie", "sab"];
+const WEEKDAY_SHORT_EN_TO_ES = {
+  Sun: "dom",
+  Mon: "lun",
+  Tue: "mar",
+  Wed: "mie",
+  Thu: "jue",
+  Fri: "vie",
+  Sat: "sab",
+};
 
 // Helper: calcula totales de una lista de servicios (ya enriquecidos)
 function calculateTotals(services) {
@@ -66,6 +75,72 @@ function parseTimeToMinutes(timeString) {
     .split(":")
     .map((n) => Number(n));
   return h * 60 + m;
+}
+
+function parseIsoDate(isoDate) {
+  const [y, m, d] = String(isoDate || "")
+    .split("-")
+    .map((n) => Number(n));
+  if (!y || !m || !d) return null;
+  return { year: y, month: m, day: d };
+}
+
+function formatIsoDateUtc(year, month, day) {
+  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function addDaysIsoDate(isoDate, days) {
+  const p = parseIsoDate(isoDate);
+  if (!p) return isoDate;
+  const dt = new Date(Date.UTC(p.year, p.month - 1, p.day + days));
+  return formatIsoDateUtc(dt.getUTCFullYear(), dt.getUTCMonth() + 1, dt.getUTCDate());
+}
+
+function getZonedParts(date, timeZone) {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+    weekday: "short",
+  });
+  const parts = fmt.formatToParts(date);
+  const bag = {};
+  for (const part of parts) {
+    if (part.type !== "literal") bag[part.type] = part.value;
+  }
+  const weekdayKey = WEEKDAY_SHORT_EN_TO_ES[bag.weekday] || "dom";
+  return {
+    year: Number(bag.year),
+    month: Number(bag.month),
+    day: Number(bag.day),
+    hour: Number(bag.hour),
+    minute: Number(bag.minute),
+    second: Number(bag.second),
+    weekdayKey,
+  };
+}
+
+function zonedDateTimeToUtc({ year, month, day, hour = 0, minute = 0, second = 0 }, timeZone) {
+  let date = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  for (let i = 0; i < 3; i += 1) {
+    const z = getZonedParts(date, timeZone);
+    const asIfUtc = Date.UTC(z.year, z.month - 1, z.day, z.hour, z.minute, z.second);
+    const targetUtc = Date.UTC(year, month - 1, day, hour, minute, second);
+    const diff = targetUtc - asIfUtc;
+    if (diff === 0) break;
+    date = new Date(date.getTime() + diff);
+  }
+  return date;
+}
+
+function isoDateInTimeZone(date, timeZone) {
+  const z = getZonedParts(date, timeZone);
+  return formatIsoDateUtc(z.year, z.month, z.day);
 }
 
 function toDateAtMinutes(baseDate, minutes) {
@@ -208,7 +283,23 @@ async function listActiveStaffIdsForNegocio(negocioId) {
  * ni con otras reservas (excluyendo excludeReservaId al reagendar).
  */
 async function assertSlotAvailable({ negocio_id, staff_id, start, end, excludeReservaId }) {
-  const weekday = WEEKDAY_MAP[start.getDay()];
+  const { data: negocio, error: negocioError } = await supabase
+    .from("negocios")
+    .select("zona_horaria")
+    .eq("id", negocio_id)
+    .single();
+
+  if (negocioError || !negocio) {
+    return {
+      ok: false,
+      status: 404,
+      error: "Business not found",
+    };
+  }
+
+  const timeZone = String(negocio.zona_horaria || "UTC");
+  const startParts = getZonedParts(start, timeZone);
+  const weekday = startParts.weekdayKey;
   const { data: horariosDia, error: horariosError } = await supabase
     .from("horarios")
     .select("*")
@@ -225,13 +316,32 @@ async function assertSlotAvailable({ negocio_id, staff_id, start, end, excludeRe
     };
   }
 
-  const dayStart = new Date(start);
-  dayStart.setHours(0, 0, 0, 0);
+  const dayInfo = {
+    year: startParts.year,
+    month: startParts.month,
+    day: startParts.day,
+  };
   let fitsSchedule = false;
 
   for (const h of horariosDia || []) {
-    const blockStart = toDateAtMinutes(dayStart, parseTimeToMinutes(h.hora_inicio));
-    const blockEnd = toDateAtMinutes(dayStart, parseTimeToMinutes(h.hora_fin));
+    const blockStartMinutes = parseTimeToMinutes(h.hora_inicio);
+    const blockEndMinutes = parseTimeToMinutes(h.hora_fin);
+    const blockStart = zonedDateTimeToUtc(
+      {
+        ...dayInfo,
+        hour: Math.floor(blockStartMinutes / 60),
+        minute: blockStartMinutes % 60,
+      },
+      timeZone
+    );
+    const blockEnd = zonedDateTimeToUtc(
+      {
+        ...dayInfo,
+        hour: Math.floor(blockEndMinutes / 60),
+        minute: blockEndMinutes % 60,
+      },
+      timeZone
+    );
     if (start >= blockStart && end <= blockEnd) {
       fitsSchedule = true;
       break;
@@ -325,9 +435,12 @@ function collectDaySlots(
   reservas,
   occupiedMinutes,
   slotStep,
-  minStartTime = null
+  minStartTime = null,
+  timeZone = "UTC"
 ) {
   const slots = [];
+  const z = getZonedParts(dayStart, timeZone);
+  const dayInfo = { year: z.year, month: z.month, day: z.day };
 
   for (const h of horarios) {
     const startMinutes = parseTimeToMinutes(h.hora_inicio);
@@ -339,7 +452,14 @@ function collectDaySlots(
       current + occupiedMinutes <= endMinutes;
       current += slotStep
     ) {
-      const slotStart = toDateAtMinutes(dayStart, current);
+      const slotStart = zonedDateTimeToUtc(
+        {
+          ...dayInfo,
+          hour: Math.floor(current / 60),
+          minute: current % 60,
+        },
+        timeZone
+      );
       const slotEnd = new Date(slotStart.getTime() + occupiedMinutes * 60 * 1000);
 
       if (minStartTime && slotStart <= minStartTime) {
@@ -434,7 +554,7 @@ const createReservaCliente = async (req, res) => {
     const { data: negocio, error: negocioError } = await supabase
       .from("negocios")
       .select(
-        "id, activo, duracion_buffer_min, stripe_connect_account_id, stripe_connect_charges_enabled"
+        "id, activo, zona_horaria, duracion_buffer_min, stripe_connect_account_id, stripe_connect_charges_enabled"
       )
       .eq("id", negocio_id)
       .eq("activo", true)
@@ -515,7 +635,9 @@ const createReservaCliente = async (req, res) => {
     const end = new Date(start.getTime() + totalOccupiedMinutes * 60 * 1000);
 
     // 4) Validate chosen slot is inside a business schedule block for that weekday
-    const weekday = WEEKDAY_MAP[start.getDay()];
+    const timeZone = String(negocio.zona_horaria || "UTC");
+    const startParts = getZonedParts(start, timeZone);
+    const weekday = startParts.weekdayKey;
     const { data: horariosDia, error: horariosError } = await supabase
       .from("horarios")
       .select("*")
@@ -531,13 +653,32 @@ const createReservaCliente = async (req, res) => {
       });
     }
 
-    const dayStart = new Date(start);
-    dayStart.setHours(0, 0, 0, 0);
+    const dayInfo = {
+      year: startParts.year,
+      month: startParts.month,
+      day: startParts.day,
+    };
     let fitsSchedule = false;
 
     for (const h of horariosDia || []) {
-      const blockStart = toDateAtMinutes(dayStart, parseTimeToMinutes(h.hora_inicio));
-      const blockEnd = toDateAtMinutes(dayStart, parseTimeToMinutes(h.hora_fin));
+      const blockStartMinutes = parseTimeToMinutes(h.hora_inicio);
+      const blockEndMinutes = parseTimeToMinutes(h.hora_fin);
+      const blockStart = zonedDateTimeToUtc(
+        {
+          ...dayInfo,
+          hour: Math.floor(blockStartMinutes / 60),
+          minute: blockStartMinutes % 60,
+        },
+        timeZone
+      );
+      const blockEnd = zonedDateTimeToUtc(
+        {
+          ...dayInfo,
+          hour: Math.floor(blockEndMinutes / 60),
+          minute: blockEndMinutes % 60,
+        },
+        timeZone
+      );
       if (start >= blockStart && end <= blockEnd) {
         fitsSchedule = true;
         break;
@@ -796,7 +937,7 @@ const createReservaAdmin = async (req, res) => {
 
     const { data: negocio, error: negocioError } = await supabase
       .from("negocios")
-      .select("id, activo, duracion_buffer_min")
+      .select("id, activo, zona_horaria, duracion_buffer_min")
       .eq("id", negocioId)
       .eq("activo", true)
       .single();
@@ -874,7 +1015,9 @@ const createReservaAdmin = async (req, res) => {
     );
     const end = new Date(start.getTime() + totalOccupiedMinutes * 60 * 1000);
 
-    const weekday = WEEKDAY_MAP[start.getDay()];
+    const timeZone = String(negocio.zona_horaria || "UTC");
+    const startParts = getZonedParts(start, timeZone);
+    const weekday = startParts.weekdayKey;
     const { data: horariosDia, error: horariosError } = await supabase
       .from("horarios")
       .select("*")
@@ -890,13 +1033,32 @@ const createReservaAdmin = async (req, res) => {
       });
     }
 
-    const dayStart = new Date(start);
-    dayStart.setHours(0, 0, 0, 0);
+    const dayInfo = {
+      year: startParts.year,
+      month: startParts.month,
+      day: startParts.day,
+    };
     let fitsSchedule = false;
 
     for (const h of horariosDia || []) {
-      const blockStart = toDateAtMinutes(dayStart, parseTimeToMinutes(h.hora_inicio));
-      const blockEnd = toDateAtMinutes(dayStart, parseTimeToMinutes(h.hora_fin));
+      const blockStartMinutes = parseTimeToMinutes(h.hora_inicio);
+      const blockEndMinutes = parseTimeToMinutes(h.hora_fin);
+      const blockStart = zonedDateTimeToUtc(
+        {
+          ...dayInfo,
+          hour: Math.floor(blockStartMinutes / 60),
+          minute: blockStartMinutes % 60,
+        },
+        timeZone
+      );
+      const blockEnd = zonedDateTimeToUtc(
+        {
+          ...dayInfo,
+          hour: Math.floor(blockEndMinutes / 60),
+          minute: blockEndMinutes % 60,
+        },
+        timeZone
+      );
       if (start >= blockStart && end <= blockEnd) {
         fitsSchedule = true;
         break;
@@ -1093,22 +1255,26 @@ const getDisponibilidadPublic = async (req, res) => {
       });
     }
 
-    const date = new Date(`${fecha}T00:00:00`);
-    if (Number.isNaN(date.getTime())) {
+    const dateParts = parseIsoDate(fecha);
+    if (!dateParts) {
       return res.status(400).json({
         ok: false,
         error: "Invalid fecha value. Use YYYY-MM-DD format",
       });
     }
 
-    const weekday = WEEKDAY_MAP[date.getDay()];
-
     const { data: negocio, error: negocioError } = await supabase
       .from("negocios")
-      .select("id, activo, duracion_buffer_min")
+      .select("id, activo, duracion_buffer_min, zona_horaria")
       .eq("id", negocio_id)
       .eq("activo", true)
       .single();
+    const timeZone = String(negocio.zona_horaria || "UTC");
+    const weekday = getZonedParts(
+      zonedDateTimeToUtc({ ...dateParts, hour: 0, minute: 0 }, timeZone),
+      timeZone
+    ).weekdayKey;
+
 
     if (negocioError || !negocio) {
       return res.status(404).json({
@@ -1192,9 +1358,13 @@ const getDisponibilidadPublic = async (req, res) => {
       });
     }
 
-    const dayStart = new Date(date);
-    dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+    const dayStart = zonedDateTimeToUtc({ ...dateParts, hour: 0, minute: 0 }, timeZone);
+    const nextDateIso = addDaysIsoDate(fecha, 1);
+    const nextDateParts = parseIsoDate(nextDateIso);
+    const dayEnd = zonedDateTimeToUtc(
+      { ...nextDateParts, hour: 0, minute: 0 },
+      timeZone
+    );
 
     const { data: bloqueos, error: bloqueosError } = await supabase
       .from("bloqueos")
@@ -1226,7 +1396,7 @@ const getDisponibilidadPublic = async (req, res) => {
     }
 
     const now = new Date();
-    const isToday = now.toDateString() === dayStart.toDateString();
+    const isToday = isoDateInTimeZone(now, timeZone) === fecha;
 
     let slots = [];
     if (selectedStaffId || activeStaffIds.length === 0) {
@@ -1240,7 +1410,8 @@ const getDisponibilidadPublic = async (req, res) => {
         }),
         occupiedMinutes,
         slotStep,
-        isToday ? now : null
+        isToday ? now : null,
+        timeZone
       );
     } else {
       const byStart = new Map();
@@ -1254,7 +1425,8 @@ const getDisponibilidadPublic = async (req, res) => {
           ),
           occupiedMinutes,
           slotStep,
-          isToday ? now : null
+          isToday ? now : null,
+          timeZone
         );
         for (const slot of candidateSlots) {
           if (!byStart.has(slot.start_iso)) {
@@ -1311,16 +1483,21 @@ const getFechasDisponiblesPublic = async (req, res) => {
       });
     }
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const endRange = new Date(today.getTime() + daysWindow * 24 * 60 * 60 * 1000);
+    const now = new Date();
 
     const { data: negocio, error: negocioError } = await supabase
       .from("negocios")
-      .select("id, activo, duracion_buffer_min")
+      .select("id, activo, duracion_buffer_min, zona_horaria")
       .eq("id", negocio_id)
       .eq("activo", true)
       .single();
+    const timeZone = String(negocio.zona_horaria || "UTC");
+    const todayIso = isoDateInTimeZone(now, timeZone);
+    const endRangeIso = addDaysIsoDate(todayIso, daysWindow + 1);
+    const todayParts = parseIsoDate(todayIso);
+    const endRangeParts = parseIsoDate(endRangeIso);
+    const todayStartUtc = zonedDateTimeToUtc({ ...todayParts, hour: 0, minute: 0 }, timeZone);
+    const endRangeUtc = zonedDateTimeToUtc({ ...endRangeParts, hour: 0, minute: 0 }, timeZone);
 
     if (negocioError || !negocio) {
       return res.status(404).json({
@@ -1411,8 +1588,8 @@ const getFechasDisponiblesPublic = async (req, res) => {
       .select("id, inicio_en, fin_en, estado, staff_id")
       .eq("negocio_id", negocio_id)
       .neq("estado", "cancelada")
-      .gt("fin_en", today.toISOString())
-      .lt("inicio_en", endRange.toISOString());
+      .gt("fin_en", todayStartUtc.toISOString())
+      .lt("inicio_en", endRangeUtc.toISOString());
 
     if (reservasError) {
       return res.status(500).json({
@@ -1425,14 +1602,16 @@ const getFechasDisponiblesPublic = async (req, res) => {
     const dates = [];
 
     for (let i = 0; i <= daysWindow; i += 1) {
-      const date = new Date(today.getTime() + i * 24 * 60 * 60 * 1000);
-      const weekday = WEEKDAY_MAP[date.getDay()];
+      const isoDate = addDaysIsoDate(todayIso, i);
+      const dayParts = parseIsoDate(isoDate);
+      const date = zonedDateTimeToUtc({ ...dayParts, hour: 0, minute: 0 }, timeZone);
+      const weekday = getZonedParts(date, timeZone).weekdayKey;
       const daySchedules = (horarios || []).filter((h) => h.dia_semana === weekday);
       if (daySchedules.length === 0) continue;
 
-      const dayStart = new Date(date);
-      dayStart.setHours(0, 0, 0, 0);
-      const nextDay = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+      const dayStart = zonedDateTimeToUtc({ ...dayParts, hour: 0, minute: 0 }, timeZone);
+      const nextDayParts = parseIsoDate(addDaysIsoDate(isoDate, 1));
+      const nextDay = zonedDateTimeToUtc({ ...nextDayParts, hour: 0, minute: 0 }, timeZone);
 
       const dayReservas = (reservas || []).filter((r) => {
         if (selectedStaffId && r.staff_id && r.staff_id !== selectedStaffId) return false;
@@ -1440,8 +1619,7 @@ const getFechasDisponiblesPublic = async (req, res) => {
         return rStart >= dayStart && rStart < nextDay;
       });
 
-      const now = new Date();
-      const isToday = now.toDateString() === dayStart.toDateString();
+      const isToday = isoDateInTimeZone(now, timeZone) === isoDate;
 
       let slots = [];
       if (selectedStaffId || activeStaffIds.length === 0) {
@@ -1452,7 +1630,8 @@ const getFechasDisponiblesPublic = async (req, res) => {
           dayReservas,
           occupiedMinutes,
           slotStep,
-          isToday ? now : null
+          isToday ? now : null,
+          timeZone
         );
       } else {
         const byStart = new Map();
@@ -1469,7 +1648,8 @@ const getFechasDisponiblesPublic = async (req, res) => {
             candidateDayReservas,
             occupiedMinutes,
             slotStep,
-            isToday ? now : null
+            isToday ? now : null,
+            timeZone
           );
           for (const slot of candidateSlots) {
             if (!byStart.has(slot.start_iso)) {
@@ -1481,7 +1661,6 @@ const getFechasDisponiblesPublic = async (req, res) => {
       }
 
       if (slots.length > 0) {
-        const isoDate = dayStart.toISOString().slice(0, 10);
         dates.push({
           date: isoDate,
           weekday,
