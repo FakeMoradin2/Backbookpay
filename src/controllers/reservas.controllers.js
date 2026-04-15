@@ -1572,9 +1572,7 @@ const getReservasNegocio = async (req, res) => {
 
     let query = supabase
       .from("reservas")
-      .select(
-        "*, usuarios!reservas_usuario_id_fkey(nombre, correo, telefono), staff:usuarios!reservas_staff_id_fkey(id, nombre, correo), reserva_servicios(*), pagos(*)"
-      )
+      .select("*")
       .eq("negocio_id", negocioId);
 
     if (from) {
@@ -1597,7 +1595,89 @@ const getReservasNegocio = async (req, res) => {
       });
     }
 
-    const sorted = sortReservasNearestFirst(data || []);
+    const rows = Array.isArray(data) ? data : [];
+    if (rows.length === 0) {
+      return res.json({
+        ok: true,
+        data: [],
+        count: 0,
+      });
+    }
+
+    const reservaIds = rows.map((r) => r.id);
+    const userIds = Array.from(
+      new Set(
+        rows
+          .flatMap((r) => [r.usuario_id, r.staff_id])
+          .filter((id) => typeof id === "string" && id.trim().length > 0)
+      )
+    );
+
+    let usersById = {};
+    if (userIds.length > 0) {
+      const { data: usersData, error: usersError } = await supabase
+        .from("usuarios")
+        .select("id, nombre, correo, telefono, rol")
+        .in("id", userIds);
+
+      if (usersError) {
+        return res.status(500).json({
+          ok: false,
+          step: "query usuarios for reservas negocio",
+          error: usersError.message,
+        });
+      }
+
+      usersById = Object.fromEntries((usersData || []).map((u) => [u.id, u]));
+    }
+
+    const { data: detallesData, error: detallesError } = await supabase
+      .from("reserva_servicios")
+      .select("*")
+      .in("reserva_id", reservaIds);
+
+    if (detallesError) {
+      return res.status(500).json({
+        ok: false,
+        step: "query reserva_servicios for reservas negocio",
+        error: detallesError.message,
+      });
+    }
+
+    const { data: pagosData, error: pagosError } = await supabase
+      .from("pagos")
+      .select("*")
+      .in("reserva_id", reservaIds);
+
+    if (pagosError) {
+      return res.status(500).json({
+        ok: false,
+        step: "query pagos for reservas negocio",
+        error: pagosError.message,
+      });
+    }
+
+    const detallesByReserva = {};
+    for (const d of detallesData || []) {
+      if (!detallesByReserva[d.reserva_id]) detallesByReserva[d.reserva_id] = [];
+      detallesByReserva[d.reserva_id].push(d);
+    }
+
+    const pagosByReserva = {};
+    for (const p of pagosData || []) {
+      if (!pagosByReserva[p.reserva_id]) pagosByReserva[p.reserva_id] = [];
+      pagosByReserva[p.reserva_id].push(p);
+    }
+
+    const hydrated = rows.map((r) => ({
+      ...r,
+      usuarios: r.usuario_id ? usersById[r.usuario_id] || null : null,
+      staff: r.staff_id ? usersById[r.staff_id] || null : null,
+      reserva_servicios: detallesByReserva[r.id] || [],
+      pagos: pagosByReserva[r.id] || [],
+    }));
+
+    const sorted = sortReservasNearestFirst(hydrated);
 
     return res.json({
       ok: true,
