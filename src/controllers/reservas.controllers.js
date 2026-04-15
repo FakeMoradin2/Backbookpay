@@ -1572,7 +1572,9 @@ const getReservasNegocio = async (req, res) => {
 
     let query = supabase
       .from("reservas")
-      .select("*, usuarios(nombre, correo, telefono), reserva_servicios(*), pagos(*)")
+      .select(
+        "*, usuarios!reservas_usuario_id_fkey(nombre, correo, telefono), staff:usuarios!reservas_staff_id_fkey(id, nombre, correo), reserva_servicios(*), pagos(*)"
+      )
       .eq("negocio_id", negocioId);
 
     if (from) {
