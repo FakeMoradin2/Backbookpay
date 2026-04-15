@@ -106,13 +106,41 @@ const createCheckoutSession = async (req, res) => {
 async function syncConnectAccountFromStripe(account) {
   const id = account?.id;
   if (!id) return;
-  await supabase
+
+  let chargesEnabled = account?.charges_enabled;
+  let detailsSubmitted = account?.details_submitted;
+
+  // Some Stripe webhook payload styles can omit these fields; fetch full account in that case.
+  if ((chargesEnabled == null || detailsSubmitted == null) && stripe) {
+    const fullAccount = await stripe.accounts.retrieve(id);
+    if (chargesEnabled == null) chargesEnabled = fullAccount?.charges_enabled;
+    if (detailsSubmitted == null) detailsSubmitted = fullAccount?.details_submitted;
+  }
+
+  const updateData = {};
+  if (chargesEnabled != null) {
+    updateData.stripe_connect_charges_enabled = !!chargesEnabled;
+  }
+  if (detailsSubmitted != null) {
+    updateData.stripe_connect_details_submitted = !!detailsSubmitted;
+  }
+
+  if (Object.keys(updateData).length === 0) return;
+
+  const { error } = await supabase
     .from("negocios")
-    .update({
-      stripe_connect_charges_enabled: !!account.charges_enabled,
-      stripe_connect_details_submitted: !!account.details_submitted,
-    })
+    .update(updateData)
     .eq("stripe_connect_account_id", id);
+
+  if (error) {
+    throw new Error(error.message || "Could not sync Stripe Connect account status");
+  }
+}
+
+async function syncConnectAccountById(accountId) {
+  if (!accountId || !stripe) return;
+  const account = await stripe.accounts.retrieve(accountId);
+  await syncConnectAccountFromStripe(account);
 }
 
 async function handleDepositSessionCompleted(session) {
@@ -256,6 +284,20 @@ const handleWebhook = async (req, res) => {
       await syncConnectAccountFromStripe(event.data.object);
     } catch (e) {
       console.error("Webhook: account.updated:", e);
+      return res.status(500).json({ ok: false, error: e.message || "Could not sync account update" });
+    }
+    return res.json({ ok: true, received: true });
+  }
+
+  if (event.type === "v2.core.account.updated") {
+    try {
+      const accountId = event?.context || event?.data?.object?.id;
+      if (accountId) {
+        await syncConnectAccountById(accountId);
+      }
+    } catch (e) {
+      console.error("Webhook: v2.core.account.updated:", e);
+      return res.status(500).json({ ok: false, error: e.message || "Could not sync account update" });
     }
     return res.json({ ok: true, received: true });
   }
@@ -522,6 +564,55 @@ const createConnectAccountLink = async (req, res) => {
   }
 };
 
+const syncConnectStatusAdmin = async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(500).json({ ok: false, error: "Stripe is not configured" });
+    }
+    if (req.user.rol !== "admin") {
+      return res.status(403).json({
+        ok: false,
+        error: "Only business administrators can sync Stripe payouts",
+      });
+    }
+
+    const negocioId = req.user.negocio_id;
+    if (!negocioId) {
+      return res.status(400).json({ ok: false, error: "No business associated" });
+    }
+
+    const { data: negocio, error: nErr } = await supabase
+      .from("negocios")
+      .select("id, stripe_connect_account_id")
+      .eq("id", negocioId)
+      .single();
+
+    if (nErr || !negocio) {
+      return res.status(404).json({ ok: false, error: "Business not found" });
+    }
+
+    if (!negocio.stripe_connect_account_id) {
+      return res.status(400).json({ ok: false, error: "Stripe account is not connected yet" });
+    }
+
+    const account = await stripe.accounts.retrieve(negocio.stripe_connect_account_id);
+    await syncConnectAccountFromStripe(account);
+
+    return res.json({
+      ok: true,
+      account_id: account.id,
+      charges_enabled: !!account.charges_enabled,
+      details_submitted: !!account.details_submitted,
+      payouts_enabled: !!account.payouts_enabled,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: e.message || "Could not sync Stripe Connect status",
+    });
+  }
+};
+
 /**
  * Client: hosted Checkout to pay reservation deposit (Connect destination charge).
  */
@@ -643,5 +734,6 @@ module.exports = {
   handleWebhook,
   completeAdminSetup,
   createConnectAccountLink,
+  syncConnectStatusAdmin,
   createDepositCheckoutSession,
 };
