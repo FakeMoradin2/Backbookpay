@@ -284,15 +284,428 @@ Ejemplos del script `sql/2026-03-25-supabase-integrity-constraints.sql`:
 
 ---
 
-## 10. Referencia rápida de API REST
+## 10. API REST — Referencia completa de endpoints
 
-Prefijo base: `/api` (montado en Express).
+**URL base (desarrollo):** `http://localhost:4000` (o el valor de `PORT`).  
+**Prefijo:** todas las rutas siguientes cuelgan de `/api/...` salvo el webhook de Stripe, registrado en `src/app.js` como `/api/stripe/webhook`.
 
-- `GET /api/health/supabase` — comprobación de conectividad a datos  
-- `POST /api/auth/login`, `POST /api/auth/register`, `GET /api/auth/me` (protegido), etc.  
-- Recursos de negocio: `negocios`, `servicios`, `horarios`, `reservas`, `bloqueos`, `pagos`, `usuarios`, `stripe`  
+**Formato:** salvo el webhook, el cuerpo suele ser **JSON** (`Content-Type: application/json`).
 
-Rutas públicas vs protegidas se definen en cada archivo de `src/routes/`.
+**Convención de respuestas:** la mayoría devuelve un objeto con `ok: boolean`. En errores suele incluirse `error` (string) y a veces `step` (contexto interno). Los mensajes de error están en **inglés** (texto del código).
+
+**Autenticación:** rutas marcadas como **Bearer** esperan cabecera:
+
+```http
+Authorization: Bearer <access_token_de_Supabase>
+```
+
+El middleware `requireAuth` (`src/middleware/requireAuth.js`) valida el JWT, carga el perfil en `usuarios` y rechaza usuarios con `activo: false`.
+
+| Código HTTP | Significado habitual |
+|-------------|----------------------|
+| 200 | Éxito (GET/PATCH con cuerpo) |
+| 201 | Recurso creado |
+| 400 | Validación / parámetros incorrectos |
+| 401 | Sin token, token inválido o perfil no encontrado |
+| 403 | Token válido pero sin permiso o rol incorrecto |
+| 404 | Recurso no encontrado |
+| 409 | Conflicto (email duplicado, solapes, etc.) |
+| 500 | Error de servidor o de Supabase/Stripe |
+| 503 | Proveedor de auth no disponible (red) |
+
+---
+
+### 10.1 Salud y webhook Stripe
+
+| Método | Ruta | Auth | Descripción |
+|--------|------|------|-------------|
+| GET | `/api/health/supabase` | No | Ping a Supabase: `select` mínimo en `negocios` (1 fila). |
+
+**`GET /api/health/supabase`**
+
+- **Respuesta 200:** `{ ok: true, message: "Supabase connection OK", sample: [...] }`
+- **500:** `{ ok: false, step, error, details? }`
+
+**`POST /api/stripe/webhook`** (definido en `app.js`, **antes** de `express.json`)
+
+- **Cuerpo:** bytes crudos del evento Stripe (`express.raw`), no JSON parseado por Express.
+- **Cabecera:** `Stripe-Signature` (obligatoria para verificar el evento).
+- **Comportamiento:** verifica firma con `STRIPE_WEBHOOK_SECRET`; procesa eventos como `checkout.session.completed`, `checkout.session.expired`, `account.updated`, etc.
+- **Respuesta 200:** `{ ok: true, received: true }` en flujos correctos.
+- **400:** firma inválida o metadata incompleta en algún flujo.
+- **500:** Stripe no configurado, webhook secret ausente, o error al procesar el evento.
+
+---
+
+### 10.2 Autenticación (`/api/auth`)
+
+| Método | Ruta | Auth | Descripción |
+|--------|------|------|-------------|
+| POST | `/api/auth/login` | No | Email + contraseña → tokens Supabase. |
+| GET | `/api/auth/me` | Bearer | Perfil ya adjuntado por middleware (`req.user`). |
+| POST | `/api/auth/register` | No | Alta de usuario (roles `admin`, `staff`, `cliente` con reglas propias). |
+| POST | `/api/auth/refresh` | No | Nuevo access token con `refresh_token`. |
+| POST | `/api/auth/logout` | No | Respuesta informativa; el cliente debe borrar tokens. |
+
+**`POST /api/auth/login`** — Body: `{ "email", "password" }`
+
+- **200:** `{ ok: true, access_token, refresh_token, expires_in, token_type, user_id }`
+- **400:** credenciales faltantes o error de Supabase Auth.
+
+**`GET /api/auth/me`** — Bearer
+
+- **200:** `{ ok: true, user: { id, correo, nombre, rol, negocio_id, activo } }` (campos del perfil cargado en middleware).
+
+**`POST /api/auth/register`** — Body (ejemplo): `{ email, password, nombre, rol?, invite_code?, negocio_id? }`
+
+- **Admin:** requiere `invite_code === ADMIN_INVITE_CODE`; crea negocio y perfil.
+- **Staff:** requiere `negocio_id`.
+- **201:** según caso: tokens si hay sesión, o `{ ok: true, message, user_id, negocio_id? }` si confirma email u otro flujo sin sesión inmediata.
+- **400 / 403 / 409 / 500:** validaciones, código de invitación, duplicados, errores DB.
+
+**`POST /api/auth/refresh`** — Body: `{ "refresh_token" }`
+
+- **200:** `{ ok: true, access_token, refresh_token, expires_in, token_type }`
+- **400:** falta `refresh_token`.
+- **401:** refresh inválido.
+
+**`POST /api/auth/logout`**
+
+- **200:** `{ ok: true, message: "Logout successful. The client must remove stored tokens." }`
+
+---
+
+### 10.3 Stripe (checkout admin, Connect, depósitos) (`/api/stripe`)
+
+Rutas en `src/routes/stripe.routes.js` (montaje `/api/stripe`). Todas las de esta tabla son **JSON** excepto el webhook ya descrito.
+
+| Método | Ruta | Auth | Descripción |
+|--------|------|------|-------------|
+| POST | `/api/stripe/create-checkout-session` | No | Crea sesión Checkout para comprar cuenta admin (pago único). |
+| POST | `/api/stripe/complete-admin-setup` | No | Tras pagar, completa registro admin con `session_id` + `password`. |
+| POST | `/api/stripe/connect/account-link` | Bearer (admin) | Onboarding Stripe Connect Express para el negocio. |
+| POST | `/api/stripe/connect/sync-status` | Bearer (admin) | Sincroniza estado de la cuenta Connect desde Stripe. |
+| POST | `/api/stripe/deposit-verify-session` | Bearer (cliente) | Verifica pago de depósito tras Checkout. |
+| POST | `/api/stripe/deposit-cancel-pending` | Bearer (cliente) | Cancela limpieza de reserva `pendiente_pago` sin pago. |
+| POST | `/api/stripe/deposit-checkout` | Bearer (cliente) | Crea Checkout Session para pagar anticipo de una reserva. |
+
+**`POST .../create-checkout-session`** — `{ nombre, email }`
+
+- **200:** `{ ok: true, url, session_id }` (URL de Stripe Checkout).
+- **400 / 409 / 500:** validación, email ya admin, error Stripe.
+
+**`POST .../complete-admin-setup`** — `{ session_id, password }`
+
+- **200:** `{ ok: true, access_token, refresh_token, expires_in, token_type, user_id }`
+- **400:** pago incompleto, sesión inválida, email faltante, etc.
+- **500:** Stripe no configurado u error al crear usuario.
+
+**`POST .../connect/account-link`**
+
+- **200:** `{ ok: true, url }` (enlace de onboarding o actualización).
+- **403 / 404 / 500:** solo admin, negocio no encontrado, error Stripe.
+
+**`POST .../connect/sync-status`**
+
+- **200:** `{ ok: true, account_id, charges_enabled, details_submitted, payouts_enabled }`
+- **400:** aún no hay cuenta Connect.
+- **403 / 404 / 500:** permisos o errores.
+
+**`POST .../deposit-verify-session`** — `{ session_id }`
+
+- **200:** `{ ok: true, verified: true, reserva_id, status: "confirmada" }` (tras aplicar lógica de depósito pagado).
+- **400 / 403 / 404 / 409:** rol, sesión incorrecta, reserva ajena, pago aún no completado (`409` con `status`, `payment_status`).
+
+**`POST .../deposit-cancel-pending`** — `{ reserva_id }`
+
+- **200:** `{ ok: true, cleaned?: boolean, skipped?: boolean }` según `cleanupPendingDepositReservation`.
+- **403 / 404 / 500:** permisos o reserva no encontrada.
+
+**`POST .../deposit-checkout`** — `{ reserva_id }`
+
+- **200:** `{ ok: true, url, session_id }`
+- **400:** estado no `pendiente_pago`, sin anticipo, negocio sin Connect, monto demasiado bajo, etc.
+- **403 / 404:** no es el cliente dueño o reserva inexistente.
+
+---
+
+### 10.4 Negocios (`/api/negocios`)
+
+| Método | Ruta | Auth | Descripción |
+|--------|------|------|-------------|
+| GET | `/api/negocios/negocios` | No | Lista negocios activos. |
+| GET | `/api/negocios/negocios/:id` | No | Detalle público de un negocio activo. |
+| GET | `/api/negocios/admin/negocio` | Bearer | Negocio del usuario autenticado. |
+| PATCH | `/api/negocios/admin/negocio` | Bearer (solo **admin**) | Actualiza datos del negocio del usuario. |
+
+**`GET .../negocios`**
+
+- **200:** `{ ok: true, data: [...], count }`
+
+**`GET .../negocios/:id`**
+
+- **200:** `{ ok: true, data: { ...negocio } }`
+- **404:** negocio inexistente o inactivo.
+
+**`GET .../admin/negocio`**
+
+- **200:** `{ ok: true, data }`
+- **404 / 500:** no encontrado o error consulta.
+
+**`PATCH .../admin/negocio`** — campos opcionales: `nombre`, `telefono`, `correo`, `zona_horaria`, `duracion_buffer_min`, `imagen_url`
+
+- **403:** usuario no es `admin`.
+- **400:** ningún campo enviado.
+- **200:** `{ ok: true, data }`
+
+---
+
+### 10.5 Servicios (`/api/servicios`)
+
+| Método | Ruta | Auth | Descripción |
+|--------|------|------|-------------|
+| GET | `/api/servicios/` | No | Lista servicios (filtros por query). |
+| GET | `/api/servicios/admin/servicios` | Bearer | Servicios activos del negocio del usuario. |
+| POST | `/api/servicios/admin/servicios` | Bearer (**admin**) | Crea servicio. |
+| PATCH | `/api/servicios/admin/servicios/:id` | Bearer (**admin**) | Actualiza servicio. |
+| DELETE | `/api/servicios/admin/servicios/:id` | Bearer (**admin**) | Baja lógica (`activo: false`). |
+
+**`GET /api/servicios/`** — Query opcional:
+
+- `negocio_id`: filtrar por negocio.
+- `q`: búsqueda por nombre/descripción (ilike).
+- `include_business=true`: incluye datos del negocio en el `select`.
+
+**200:** `{ ok: true, data: [...], count }`
+
+**`GET .../admin/servicios`**
+
+- **200:** `{ ok: true, data, count }`
+
+**`POST .../admin/servicios`** — Requiere `nombre`, `duracion_min`, `precio`, `anticipo_tipo` (`fijo` | `porcentaje` | `no_requiere`); reglas de `anticipo_valor` y, si aplica depósito, negocio con Stripe Connect listo.
+
+- **201:** `{ ok: true, data }`
+- **400 / 403 / 500:** validación, permisos, Stripe no listo para anticipos.
+
+**`PATCH .../admin/servicios/:id`** — campos parciales; mismas reglas de anticipo/Stripe si se exige depósito.
+
+- **200:** `{ ok: true, data }`
+- **404:** servicio no pertenece al negocio.
+
+**`DELETE .../admin/servicios/:id`**
+
+- **200:** `{ ok: true, data }` (registro con `activo: false`).
+
+---
+
+### 10.6 Horarios (`/api/horarios`)
+
+Días válidos: `lun`, `mar`, `mie`, `jue`, `vie`, `sab`, `dom`. Crear/editar horarios: solo **admin**.
+
+| Método | Ruta | Auth |
+|--------|------|------|
+| GET | `/api/horarios/admin/horarios` | Bearer |
+| POST | `/api/horarios/admin/horarios` | Bearer (admin) |
+| POST | `/api/horarios/admin/horarios/bulk` | Bearer (admin) |
+| PATCH | `/api/horarios/admin/horarios/:id` | Bearer (admin) |
+| DELETE | `/api/horarios/admin/horarios/:id` | Bearer (admin) |
+
+**`GET .../admin/horarios`**
+
+- **200:** `{ ok: true, data: [...], count }` (solo `activo: true`).
+
+**`POST .../admin/horarios`** — `{ dia_semana, hora_inicio, hora_fin, activo? }`
+
+- **201:** `{ ok: true, data }`
+- **400:** solape con otro bloque del mismo día, u otras validaciones.
+
+**`POST .../admin/horarios/bulk`** — `{ dias_semana: ["lun", ...], hora_inicio, hora_fin, activo? }`
+
+- **201:** `{ ok: true, created: [...], failed?, message }` (puede crear parcialmente y listar `failed` por día).
+
+**`PATCH .../admin/horarios/:id`**
+
+- **200:** `{ ok: true, data }`
+- **404:** bloque no encontrado.
+
+**`DELETE .../admin/horarios/:id`**
+
+- **200:** `{ ok: true, data }` (fila eliminada).
+
+---
+
+### 10.7 Bloqueos (`/api/bloqueos`)
+
+Solo **admin** del negocio.
+
+| Método | Ruta | Auth |
+|--------|------|------|
+| GET | `/api/bloqueos/admin/bloqueos` | Bearer |
+| POST | `/api/bloqueos/admin/bloqueos` | Bearer |
+| DELETE | `/api/bloqueos/admin/bloqueos/:id` | Bearer |
+
+**`POST .../admin/bloqueos`** — `{ inicio_en, fin_en, motivo? }` (ISO datetimes)
+
+- **201:** `{ ok: true, data }`
+- **409:** existen reservas `pendiente_pago` o `confirmadas` en el intervalo (`conflicts`, `conflicts_count`).
+
+**`DELETE .../admin/bloqueos/:id`**
+
+- **200:** `{ ok: true, data }` (datos del bloqueo eliminado).
+
+---
+
+### 10.8 Pagos (`/api/pagos`)
+
+| Método | Ruta | Auth | Descripción |
+|--------|------|------|-------------|
+| GET | `/api/pagos/admin/pagos` | Bearer (**admin** o **staff**) | Lista pagos de reservas del negocio. |
+
+**Query opcional:** `status` (estado de pago), `from`, `to` (fechas sobre `creado_en`), `reserva_id`.
+
+- **200:** `{ ok: true, data: [...], count }` cada ítem incluye relación `reservas(...)` cuando aplica.
+- **403:** rol no permitido.
+- **400:** usuario sin `negocio_id`.
+
+Estados válidos filtro: `creado`, `pendiente`, `pagado`, `fallido`, `cancelado`, `reembolsado`.
+
+---
+
+### 10.9 Usuarios / perfiles (`/api/usuarios`)
+
+| Método | Ruta | Auth | Descripción |
+|--------|------|------|-------------|
+| GET | `/api/usuarios/me` | Bearer | Perfil desde tabla `usuarios` (`telefono`, `creado_en`, etc.); más campos que `GET /api/auth/me`. |
+| PATCH | `/api/usuarios/me` | Bearer | Actualiza `nombre`, `correo`, `telefono` del perfil. |
+| GET | `/api/usuarios/admin/staff` | Bearer (admin/staff) | Lista staff del negocio. |
+| POST | `/api/usuarios/admin/staff` | Bearer (**admin**) | Crea usuario staff (requiere `SUPABASE_SERVICE_ROLE_KEY`). |
+| PATCH | `/api/usuarios/admin/staff/:id/active` | Bearer (**admin**) | Activa/desactiva staff (`activo` boolean). |
+| GET | `/api/usuarios/public/staff` | No | Staff público por negocio. |
+
+**`GET .../public/staff`** — Query: `negocio_id` (obligatorio)
+
+- **200:** `{ ok: true, data: [{ id, nombre }], count }`
+
+**`POST .../admin/staff`** — `{ nombre, correo, telefono?, password }` (password mín. 6 caracteres)
+
+- **201:** `{ ok: true, data: perfil staff }`
+- **409:** email ya registrado.
+- **500:** falta service role key en servidor.
+
+**`PATCH .../admin/staff/:id/active`** — `{ activo: boolean }`
+
+- **200:** `{ ok: true, data }`
+- **409:** al desactivar, si hay reservas futuras activas asignadas (`conflicts`, `conflicts_count`).
+
+---
+
+### 10.10 Reservas (`/api/reservas`)
+
+Estados válidos globales (referencia): `pendiente_pago`, `confirmada`, `cancelada`, `completada`, `no_show`, `expirada`.
+
+#### Públicos (sin Bearer)
+
+| Método | Ruta | Query / notas |
+|--------|------|----------------|
+| GET | `/api/reservas/public/disponibilidad` | `negocio_id`, `fecha` (YYYY-MM-DD), `servicio_ids` (CSV), opcional `staff_id`, `step_min` (default 15) |
+| GET | `/api/reservas/public/fechas-disponibles` | `negocio_id`, `servicio_ids`, opcional `staff_id`, `step_min`, `days` (default 30, máx 365) |
+
+**`.../disponibilidad` — 200:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "slots": [
+      {
+        "label": "09:00",
+        "start_iso": "...",
+        "end_iso": "...",
+        "block_key": "...",
+        "block_start": "...",
+        "block_end": "..."
+      }
+    ],
+    "occupied_minutes": 60
+  }
+}
+```
+
+Si no hay horario ese día: `slots: []`.
+
+**`.../fechas-disponibles` — 200:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "dates": [{ "date": "2026-04-20", "weekday": "lun", "slots_count": 12 }],
+    "occupied_minutes": 60
+  }
+}
+```
+
+#### Cliente (Bearer, rol `cliente`)
+
+| Método | Ruta | Descripción |
+|--------|------|-------------|
+| GET | `/api/reservas/cliente/mis-reservas` | Lista reservas del usuario (excluye `cancelada`), con `reserva_servicios` y nombre de negocio. |
+| POST | `/api/reservas/cliente/reservas` | Crea reserva. |
+| POST | `/api/reservas/cliente/reservas/:id/cancel` | Elimina reserva y líneas relacionadas (no estados finales). |
+| PATCH | `/api/reservas/cliente/reservas/:id/reagendar` | Cambia `inicio_en`/`fin_en` si estado permite. |
+
+**`POST .../cliente/reservas`** — Body:
+
+```json
+{
+  "negocio_id": "uuid",
+  "staff_id": "uuid opcional",
+  "servicios": [{ "servicio_id": "uuid", "cantidad": 1 }],
+  "inicio_en": "ISO8601",
+  "nota": "opcional"
+}
+```
+
+- **201:** `{ ok: true, data: { reserva, servicios, computed_end, occupied_minutes, deposit_amount, can_pay_deposit_online } }`
+- Estado inicial: `pendiente_pago` si hay anticipo > 0; si no, `confirmada`.
+- **403 / 404 / 400:** rol, negocio, horario, solapes, bloqueos, staff.
+
+**`POST .../cliente/reservas/:id/cancel`**
+
+- **200:** `{ ok: true, deleted: true, id }` (borrado físico de reserva, detalles y pagos asociados en flujo cancelación).
+- **400:** estado `completada`, `cancelada` o `expirada`.
+
+**`PATCH .../cliente/reservas/:id/reagendar`** — `{ inicio_en }`
+
+- **200:** `{ ok: true, data: reserva actualizada }`
+- Solo si estado en `pendiente_pago` o `confirmada`.
+
+#### Admin / Staff (Bearer)
+
+| Método | Ruta | Descripción |
+|--------|------|-------------|
+| POST | `/api/reservas/admin/reservas` | Cita manual (cliente registrado o invitado). |
+| GET | `/api/reservas/admin/reservas` | Lista reservas del negocio; hidrata cliente, staff, `reserva_servicios`, `pagos`. |
+| PATCH | `/api/reservas/admin/reservas/:id/estado` | Cambia `estado`. |
+| PATCH | `/api/reservas/admin/reservas/:id/reagendar` | Reagenda; body puede incluir `staff_id` (admin); staff forzado a sí mismo si rol `staff`. |
+| PATCH | `/api/reservas/admin/reservas/:id/staff` | Reasigna `staff_id` si el hueco sigue libre. |
+
+**`POST .../admin/reservas`** — Body incluye `servicios`, `inicio_en`, opcional `cliente_id` **o** datos manuales `cliente_nombre`, `cliente_correo`, `cliente_telefono`, `staff_id`, `nota`, `estado` (opcional, debe ser estado válido).
+
+- **201:** `{ ok: true, data: { reserva, client, servicios, computed_end, occupied_minutes } }`
+- Staff con rol `staff` se asigna a sí mismo; admin puede elegir staff.
+
+**`GET .../admin/reservas`** — Query: `from`, `to` (sobre `inicio_en`), `status` (filtro estado).
+
+- **200:** `{ ok: true, data: [...], count }` cada elemento incluye `usuarios`, `staff`, `reserva_servicios`, `pagos`.
+
+**`PATCH .../admin/reservas/:id/estado`** — `{ estado }`
+
+- **200:** `{ ok: true, data }`
+
+**`PATCH .../admin/reservas/:id/reagendar`** — `{ inicio_en, staff_id? }` (reglas de staff arriba)
+
+**`PATCH .../admin/reservas/:id/staff`** — `{ staff_id }` (obligatorio; staff solo puede asignarse a sí mismo)
 
 ---
 
