@@ -709,7 +709,62 @@ Si no hay horario ese día: `slots: []`.
 
 ---
 
-## 11. Ejecución local
+## 11. Rúbrica académica: scripts SQL, integridad referencial, seguridad y MVC
+
+### 11.1 Paquete `sql/rubric/` (roles, seed, consultas, vistas, mantenimiento)
+
+| Archivo | Contenido |
+|---------|-----------|
+| `sql/rubric/README.md` | Orden de ejecución y notas Supabase |
+| `01_roles_privileges.sql` | Tres roles: **Analista** (solo `SELECT`), **Editor** (DML en tablas operativas; ejemplo de `REVOKE DELETE`), **Admin DB** (privilegios amplios) + usuarios de login de demo |
+| `02_seed_stress_test.sql` | Carga masiva: ≥100 filas en `negocios`, `servicios`, `horarios`, `bloqueos`, `reservas`, `reserva_servicios`, `pagos` (prefijo `Stress Seed` / `Cliente Stress` para limpieza) |
+| `03_queries_basic.sql` | 40 consultas básicas |
+| `04_queries_intermediate.sql` | 20 consultas con JOIN, `GROUP BY`/`HAVING`, subconsultas |
+| `05_queries_advanced.sql` | 20 consultas: CTE, funciones de ventana, `WITH RECURSIVE`, transacciones |
+| `06_views_indexes_explain.sql` | Vistas de reporte + índice demo + `EXPLAIN (ANALYZE)` |
+| `07_maintenance_update_delete.sql` | `UPDATE` masivos y `DELETE` controlados en transacciones |
+
+Índice de cobertura: `docs/RUBRICA-BD.md`.
+
+### 11.2 Tabla referencial: PK, FK y políticas típicas (PostgreSQL)
+
+Las políticas **ON DELETE** exactas dependen de las migraciones aplicadas en Supabase; a continuación el **modelo lógico** alineado al código y a `sql/2026-04-15-staff-reservas.sql`:
+
+| Tabla | PK | FK principales | ON DELETE (referencia) |
+|-------|-----|----------------|-------------------------|
+| `negocios` | `id` (uuid) | — | — |
+| `usuarios` | `id` (uuid) | `negocio_id` → `negocios.id` | suele ser **SET NULL** o **RESTRICT** según migración |
+| `servicios` | `id` | `negocio_id` → `negocios.id` | **CASCADE** o **RESTRICT** (evitar borrar negocio con servicios) |
+| `horarios` | `id` | `negocio_id` → `negocios.id` | **CASCADE** típico |
+| `bloqueos` | `id` | `negocio_id` → `negocios.id` | **CASCADE** típico |
+| `reservas` | `id` | `negocio_id` → `negocios.id`; `usuario_id` → `usuarios.id`; `staff_id` → `usuarios.id` | `staff_id`: **SET NULL** (`2026-04-15-staff-reservas.sql`); resto según migración |
+| `reserva_servicios` | `id` | `reserva_id` → `reservas.id`; `servicio_id` → `servicios.id` | **CASCADE** al borrar reserva/servicio (habitual) |
+| `pagos` | `id` | `reserva_id` → `reservas.id` | **CASCADE** o **RESTRICT** |
+
+**Restricciones adicionales:** `UNIQUE` en columnas de negocio según diseño; `NOT NULL` en campos obligatorios; **CHECK** y **EXCLUDE** en `sql/2026-03-25-supabase-integrity-constraints.sql`.
+
+### 11.3 Seguridad: AES, BCrypt y TLS (cierre de rúbrica)
+
+| Tema | Implementación en el proyecto |
+|------|-------------------------------|
+| **TLS/SSL** | Tráfico hacia Supabase y Stripe por **HTTPS**; en producción el API debe publicarse también con TLS. |
+| **Hashing de contraseñas (equivalente BCrypt)** | No se hashea en Node: **Supabase Auth** almacena credenciales con esquemas fuertes (p. ej. derivación tipo bcrypt/argon según versión del servicio). |
+| **AES (encriptación de datos sensibles)** | La aplicación **no** implementa AES propio; datos de pago sensibles se delegan a **Stripe** (PCI). Para campos propios cifrados en reposo, usar pgcrypto / columnas cifradas en Postgres o políticas del proveedor. |
+
+### 11.4 Manejo de errores de base en el backend
+
+- Utilidad: `src/utils/postgresErrors.js` — traduce códigos PostgreSQL (`23505` duplicado, `23503` FK, `23514` CHECK/EXCLUDE, etc.) a HTTP **409**/**400**.
+- Uso de ejemplo: inserción/actualización/baja lógica en `src/controllers/servicios.controllers.js`.
+
+### 11.5 Respaldos, alta disponibilidad y migraciones
+
+- Comandos **pg_dump** / **pg_restore** y conceptos de réplica / Multi-AZ: `docs/BACKUPS-HA-MIGRACIONES.md`.
+- Convención de migraciones tipo Flyway: `sql/migrations/README.md`.
+- **MVC** (API + frontend): `docs/MVC.md`.
+
+---
+
+## 12. Ejecución local
 
 ```bash
 npm install
@@ -721,4 +776,4 @@ El servidor escucha en `PORT` (por defecto `4000`).
 
 ---
 
-*Documentación alineada al código del repositorio BackBookNPay. Para el diccionario visual completo, consultar el ERD del sistema de reservas en documentación de equipo o diagramas adjuntos.*
+*Documentación alineada al código del repositorio BackBookNPay. Para el diccionario visual completo, consultar el ERD del sistema de reservas en documentación de equipo o diagramas adjuntos. Entregables SQL de rúbrica: `sql/rubric/` y `docs/RUBRICA-BD.md`.*

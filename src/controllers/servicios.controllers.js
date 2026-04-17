@@ -1,4 +1,5 @@
 const supabase = require('../config/supabase');
+const { mapPostgresError } = require("../utils/postgresErrors");
 
 /** Deposit rules (fijo / porcentaje) require Stripe Connect ready to charge online. */
 async function negocioStripeDepositsReady(negocioId) {
@@ -192,10 +193,8 @@ const createServicio = async (req, res) => {
       .single();
 
     if (error) {
-      return res.status(500).json({
-        ok: false,
-        error: error.message,
-      });
+      const mapped = mapPostgresError(error);
+      return res.status(mapped.status).json(mapped.body);
     }
 
     return res.status(201).json({
@@ -376,10 +375,8 @@ const updateServicio = async (req, res) => {
       .single();
 
     if (error) {
-      return res.status(500).json({
-        ok: false,
-        error: error.message,
-      });
+      const mapped = mapPostgresError(error);
+      return res.status(mapped.status).json(mapped.body);
     }
 
     return res.json({
@@ -441,10 +438,8 @@ const deleteServicio = async (req, res) => {
       .single();
 
     if (errorUpdate) {
-      return res.status(500).json({
-        ok: false,
-        error: errorUpdate.message,
-      });
+      const mapped = mapPostgresError(errorUpdate);
+      return res.status(mapped.status).json(mapped.body);
     }
 
     return res.json({
