@@ -123,7 +123,7 @@ const createCheckoutSession = async (req, res) => {
               description: "Access to the admin panel. Manage your business, services, schedule and payments.",
               images: [],
             },
-            unit_amount: parseInt(process.env.STRIPE_PRICE_CENTS || "9900", 10),
+            unit_amount: parseInt(process.env.STRIPE_PRICE_CENTS || "150000", 10),
           },
           quantity: 1,
         },
