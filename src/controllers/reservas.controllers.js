@@ -215,6 +215,11 @@ function overlaps(startA, endA, startB, endB) {
   return startA < endB && endA > startB;
 }
 
+function bloqueoAfectaStaff(bloqueoStaffId, targetStaffId) {
+  if (!bloqueoStaffId) return true;
+  return !!targetStaffId && bloqueoStaffId === targetStaffId;
+}
+
 async function resolveStaffForNegocio(negocioId, staffId, { requireActive = true } = {}) {
   if (!staffId) {
     return {
@@ -371,6 +376,7 @@ async function assertSlotAvailable({ negocio_id, staff_id, start, end, excludeRe
   }
 
   for (const b of bloqueos || []) {
+    if (!bloqueoAfectaStaff(b.staff_id || null, staff_id || null)) continue;
     const bStart = new Date(b.inicio_en);
     const bEnd = new Date(b.fin_en);
     if (overlaps(start, end, bStart, bEnd)) {
@@ -436,7 +442,8 @@ function collectDaySlots(
   occupiedMinutes,
   slotStep,
   minStartTime = null,
-  timeZone = "UTC"
+  timeZone = "UTC",
+  targetStaffId = null
 ) {
   const slots = [];
   const z = getZonedParts(dayStart, timeZone);
@@ -469,6 +476,7 @@ function collectDaySlots(
       let blocked = false;
 
       for (const b of bloqueos || []) {
+        if (!bloqueoAfectaStaff(b.staff_id || null, targetStaffId || null)) continue;
         if (overlaps(slotStart, slotEnd, new Date(b.inicio_en), new Date(b.fin_en))) {
           blocked = true;
           break;
@@ -706,6 +714,7 @@ const createReservaCliente = async (req, res) => {
     }
 
     for (const b of bloqueos || []) {
+      if (!bloqueoAfectaStaff(b.staff_id || null, selectedStaffId || null)) continue;
       const bStart = new Date(b.inicio_en);
       const bEnd = new Date(b.fin_en);
       if (overlaps(start, end, bStart, bEnd)) {
@@ -1092,6 +1101,7 @@ const createReservaAdmin = async (req, res) => {
     }
 
     for (const b of bloqueos || []) {
+      if (!bloqueoAfectaStaff(b.staff_id || null, selectedStaffId || null)) continue;
       const bStart = new Date(b.inicio_en);
       const bEnd = new Date(b.fin_en);
       if (overlaps(start, end, bStart, bEnd)) {
@@ -1467,6 +1477,7 @@ const createReservaPublic = async (req, res) => {
     }
 
     for (const b of bloqueos || []) {
+      if (!bloqueoAfectaStaff(b.staff_id || null, selectedStaffId || null)) continue;
       const bStart = new Date(b.inicio_en);
       const bEnd = new Date(b.fin_en);
       if (overlaps(start, end, bStart, bEnd)) {
@@ -1788,7 +1799,8 @@ const getDisponibilidadPublic = async (req, res) => {
         occupiedMinutes,
         slotStep,
         isToday ? now : null,
-        timeZone
+        timeZone,
+        selectedStaffId
       );
     } else {
       const byStart = new Map();
@@ -1803,7 +1815,8 @@ const getDisponibilidadPublic = async (req, res) => {
           occupiedMinutes,
           slotStep,
           isToday ? now : null,
-          timeZone
+          timeZone,
+          candidateStaffId
         );
         for (const slot of candidateSlots) {
           if (!byStart.has(slot.start_iso)) {
@@ -2008,7 +2021,8 @@ const getFechasDisponiblesPublic = async (req, res) => {
           occupiedMinutes,
           slotStep,
           isToday ? now : null,
-          timeZone
+          timeZone,
+          selectedStaffId
         );
       } else {
         const byStart = new Map();
@@ -2026,7 +2040,8 @@ const getFechasDisponiblesPublic = async (req, res) => {
             occupiedMinutes,
             slotStep,
             isToday ? now : null,
-            timeZone
+            timeZone,
+            candidateStaffId
           );
           for (const slot of candidateSlots) {
             if (!byStart.has(slot.start_iso)) {
