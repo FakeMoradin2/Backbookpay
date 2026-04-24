@@ -5,6 +5,7 @@ const requireAuth = require("../middleware/requireAuth");
 const {
   createReservaCliente,
   createReservaAdmin,
+  createReservaPublic,
   getDisponibilidadPublic,
   getFechasDisponiblesPublic,
   getReservasCliente,
@@ -19,6 +20,7 @@ const {
 // Public
 router.get("/public/disponibilidad", getDisponibilidadPublic);
 router.get("/public/fechas-disponibles", getFechasDisponiblesPublic);
+router.post("/public/reservas", createReservaPublic);
 
 // Client
 router.get("/cliente/mis-reservas", requireAuth, getReservasCliente);

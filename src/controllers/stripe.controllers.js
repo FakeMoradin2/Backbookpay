@@ -1043,6 +1043,118 @@ const createDepositCheckoutSession = async (req, res) => {
   }
 };
 
+const createDepositCheckoutSessionPublic = async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(500).json({ ok: false, error: "Stripe is not configured" });
+    }
+
+    const reservaId = String(req.body?.reserva_id || "").trim();
+    if (!reservaId) {
+      return res.status(400).json({ ok: false, error: "reserva_id is required" });
+    }
+
+    const { data: reserva, error: rErr } = await supabase
+      .from("reservas")
+      .select("id, usuario_id, negocio_id, estado, anticipo_calculado")
+      .eq("id", reservaId)
+      .single();
+
+    if (rErr || !reserva) {
+      return res.status(404).json({ ok: false, error: "Reservation not found" });
+    }
+
+    // Public checkout is intended for guest reservations.
+    if (reserva.usuario_id) {
+      return res.status(400).json({
+        ok: false,
+        error: "This reservation must be paid from a signed-in client account",
+      });
+    }
+
+    if (reserva.estado !== "pendiente_pago") {
+      return res.status(400).json({
+        ok: false,
+        error: "Reservation does not require this payment",
+      });
+    }
+
+    const deposit = Number(reserva.anticipo_calculado);
+    if (!Number.isFinite(deposit) || deposit <= 0) {
+      return res.status(400).json({ ok: false, error: "No deposit amount for this reservation" });
+    }
+
+    const { data: negocio, error: nErr } = await supabase
+      .from("negocios")
+      .select("id, nombre, stripe_connect_account_id, stripe_connect_charges_enabled, activo")
+      .eq("id", reserva.negocio_id)
+      .single();
+
+    if (nErr || !negocio || !negocio.activo) {
+      return res.status(400).json({ ok: false, error: "Business not available" });
+    }
+
+    if (!negocio.stripe_connect_account_id || !negocio.stripe_connect_charges_enabled) {
+      return res.status(400).json({
+        ok: false,
+        error: "This business is not accepting online deposits yet",
+      });
+    }
+
+    const currency = getStripeCurrency();
+    const amountCents = Math.round(deposit * 100);
+    if (amountCents < 50) {
+      return res.status(400).json({ ok: false, error: "Deposit amount is too small to charge" });
+    }
+
+    const feeCents = platformFeeAmountCents(amountCents);
+    const frontendUrl = normalizeEnvSecret(process.env.FRONTEND_URL) || "http://localhost:3000";
+    const bookingUrl = `${frontendUrl}/businesses/${encodeURIComponent(negocio.id)}/book`;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price_data: {
+            currency,
+            unit_amount: amountCents,
+            product_data: {
+              name: "Reservation deposit",
+              description: negocio.nombre ? `Booking at ${negocio.nombre}` : "Booking deposit",
+            },
+          },
+          quantity: 1,
+        },
+      ],
+      payment_intent_data: {
+        application_fee_amount: feeCents > 0 ? feeCents : undefined,
+        transfer_data: {
+          destination: negocio.stripe_connect_account_id,
+        },
+      },
+      metadata: {
+        type: "deposit_payment",
+        reserva_id: String(reserva.id),
+        negocio_id: String(negocio.id),
+      },
+      success_url: `${bookingUrl}?deposit=success`,
+      cancel_url: `${bookingUrl}?deposit=canceled&reserva_id=${encodeURIComponent(reserva.id)}`,
+    });
+
+    return res.json({
+      ok: true,
+      url: session.url,
+      session_id: session.id,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: e.message || "Could not start payment",
+    });
+  }
+};
+
 module.exports = {
   createCheckoutSession,
   handleWebhook,
@@ -1052,4 +1164,5 @@ module.exports = {
   verifyDepositCheckoutSessionCliente,
   cancelPendingDepositReservationCliente,
   createDepositCheckoutSession,
+  createDepositCheckoutSessionPublic,
 };

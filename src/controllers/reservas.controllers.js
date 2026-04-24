@@ -934,6 +934,12 @@ const createReservaAdmin = async (req, res) => {
         error: "cliente_nombre is required when client is not registered",
       });
     }
+    if (!client && !manualPhone) {
+      return res.status(400).json({
+        ok: false,
+        error: "cliente_telefono is required when client is not registered",
+      });
+    }
 
     const { data: negocio, error: negocioError } = await supabase
       .from("negocios")
@@ -1219,6 +1225,377 @@ const createReservaAdmin = async (req, res) => {
         servicios: detallesPayload,
         computed_end: end.toISOString(),
         occupied_minutes: totalOccupiedMinutes,
+      },
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      step: "exception",
+      error: e.message,
+    });
+  }
+};
+
+// Public: create reservation for a registered or guest client
+const createReservaPublic = async (req, res) => {
+  try {
+    const {
+      negocio_id,
+      cliente_correo,
+      cliente_nombre,
+      cliente_telefono,
+      staff_id,
+      servicios, // [{ servicio_id, cantidad }]
+      inicio_en,
+      nota,
+    } = req.body;
+
+    if (!negocio_id) {
+      return res.status(400).json({
+        ok: false,
+        error: "negocio_id is required",
+      });
+    }
+
+    if (!Array.isArray(servicios) || servicios.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "At least one service is required",
+      });
+    }
+
+    if (!inicio_en) {
+      return res.status(400).json({
+        ok: false,
+        error: "Start datetime is required",
+      });
+    }
+
+    const start = new Date(inicio_en);
+    if (!(start instanceof Date) || Number.isNaN(start.getTime())) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid start datetime",
+      });
+    }
+
+    if (start <= new Date()) {
+      return res.status(400).json({
+        ok: false,
+        error: "Start datetime must be in the future",
+      });
+    }
+
+    const manualName = String(cliente_nombre || "").trim();
+    const manualEmail = String(cliente_correo || "")
+      .trim()
+      .toLowerCase();
+    const manualPhone = String(cliente_telefono || "").trim();
+
+    let client = null;
+    if (manualEmail) {
+      const { data: clientRows, error: clientError } = await supabase
+        .from("usuarios")
+        .select("id, nombre, correo, rol, activo")
+        .eq("rol", "cliente")
+        .eq("activo", true)
+        .eq("correo", manualEmail)
+        .limit(1);
+
+      if (clientError) {
+        return res.status(500).json({
+          ok: false,
+          step: "query client",
+          error: clientError.message,
+        });
+      }
+      client = Array.isArray(clientRows) ? clientRows[0] : null;
+    }
+
+    if (!client && !manualName) {
+      return res.status(400).json({
+        ok: false,
+        error: "cliente_nombre is required when client is not registered",
+      });
+    }
+
+    const { data: negocio, error: negocioError } = await supabase
+      .from("negocios")
+      .select(
+        "id, activo, zona_horaria, duracion_buffer_min, stripe_connect_account_id, stripe_connect_charges_enabled"
+      )
+      .eq("id", negocio_id)
+      .eq("activo", true)
+      .single();
+
+    if (negocioError || !negocio) {
+      return res.status(404).json({
+        ok: false,
+        error: "Business not found or inactive",
+      });
+    }
+
+    const activeStaffResult = await listActiveStaffIdsForNegocio(negocio_id);
+    if (!activeStaffResult.ok) {
+      return res.status(500).json({
+        ok: false,
+        step: "query active staff",
+        error: activeStaffResult.error,
+      });
+    }
+    const activeStaffIds = activeStaffResult.ids;
+    let selectedStaffId = null;
+    const requestedStaffId = String(staff_id || "").trim() || null;
+    if (activeStaffIds.length > 0 && requestedStaffId) {
+      const staffCheck = await resolveStaffForNegocio(negocio_id, requestedStaffId, {
+        requireActive: true,
+      });
+      if (!staffCheck.ok) {
+        return res.status(staffCheck.status || 400).json({
+          ok: false,
+          error: staffCheck.error,
+          step: staffCheck.step,
+        });
+      }
+      selectedStaffId = requestedStaffId;
+    }
+
+    const serviceIds = servicios.map((s) => s.servicio_id);
+    const { data: serviciosDb, error: serviciosError } = await supabase
+      .from("servicios")
+      .select("*")
+      .in("id", serviceIds)
+      .eq("negocio_id", negocio_id)
+      .eq("activo", true);
+
+    if (serviciosError) {
+      return res.status(500).json({
+        ok: false,
+        step: "query servicios",
+        error: serviciosError.message,
+      });
+    }
+
+    if (!serviciosDb || serviciosDb.length !== serviceIds.length) {
+      return res.status(400).json({
+        ok: false,
+        error: "Some services are invalid or inactive for this business",
+      });
+    }
+
+    const selectedServiceRows = servicios.map((s) => {
+      const row = serviciosDb.find((x) => x.id === s.servicio_id);
+      return {
+        ...row,
+        cantidad: s.cantidad ?? 1,
+      };
+    });
+
+    const totalOccupiedMinutes = computeTotalOccupiedMinutes(
+      selectedServiceRows,
+      Number(negocio.duracion_buffer_min || 0)
+    );
+    const end = new Date(start.getTime() + totalOccupiedMinutes * 60 * 1000);
+
+    const timeZone = String(negocio.zona_horaria || "UTC");
+    const startParts = getZonedParts(start, timeZone);
+    const weekday = startParts.weekdayKey;
+    const { data: horariosDia, error: horariosError } = await supabase
+      .from("horarios")
+      .select("*")
+      .eq("negocio_id", negocio_id)
+      .eq("dia_semana", weekday)
+      .eq("activo", true);
+
+    if (horariosError) {
+      return res.status(500).json({
+        ok: false,
+        step: "query horarios",
+        error: horariosError.message,
+      });
+    }
+
+    const dayInfo = {
+      year: startParts.year,
+      month: startParts.month,
+      day: startParts.day,
+    };
+    let fitsSchedule = false;
+    for (const h of horariosDia || []) {
+      const blockStartMinutes = parseTimeToMinutes(h.hora_inicio);
+      const blockEndMinutes = parseTimeToMinutes(h.hora_fin);
+      const blockStart = zonedDateTimeToUtc(
+        {
+          ...dayInfo,
+          hour: Math.floor(blockStartMinutes / 60),
+          minute: blockStartMinutes % 60,
+        },
+        timeZone
+      );
+      const blockEnd = zonedDateTimeToUtc(
+        {
+          ...dayInfo,
+          hour: Math.floor(blockEndMinutes / 60),
+          minute: blockEndMinutes % 60,
+        },
+        timeZone
+      );
+      if (start >= blockStart && end <= blockEnd) {
+        fitsSchedule = true;
+        break;
+      }
+    }
+
+    if (!fitsSchedule) {
+      return res.status(400).json({
+        ok: false,
+        error: "Selected start time is outside business schedule",
+      });
+    }
+
+    const { data: bloqueos, error: bloqueosError } = await supabase
+      .from("bloqueos")
+      .select("*")
+      .eq("negocio_id", negocio_id);
+
+    if (bloqueosError) {
+      return res.status(500).json({
+        ok: false,
+        step: "query bloqueos",
+        error: bloqueosError.message,
+      });
+    }
+
+    for (const b of bloqueos || []) {
+      const bStart = new Date(b.inicio_en);
+      const bEnd = new Date(b.fin_en);
+      if (overlaps(start, end, bStart, bEnd)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Requested time is blocked",
+        });
+      }
+    }
+
+    const { data: reservasExistentes, error: reservasError } = await supabase
+      .from("reservas")
+      .select("id, inicio_en, fin_en, estado, staff_id")
+      .eq("negocio_id", negocio_id)
+      .neq("estado", "cancelada");
+
+    if (reservasError) {
+      return res.status(500).json({
+        ok: false,
+        step: "query reservas",
+        error: reservasError.message,
+      });
+    }
+
+    if (!selectedStaffId && activeStaffIds.length > 0) {
+      const firstFreeStaff = activeStaffIds.find(
+        (candidateStaffId) => !hasOverlapForStaff(reservasExistentes || [], candidateStaffId, start, end)
+      );
+      if (!firstFreeStaff) {
+        return res.status(400).json({
+          ok: false,
+          error: "No staff member is available at that time. Please choose another slot.",
+        });
+      }
+      selectedStaffId = firstFreeStaff;
+    } else if (hasOverlapForStaff(reservasExistentes || [], selectedStaffId, start, end)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Requested time overlaps an existing reservation",
+      });
+    }
+
+    const detailedServices = servicios.map((s) => {
+      const servicioDb = serviciosDb.find((x) => x.id === s.servicio_id);
+      const base = mapServiceDeposit(servicioDb, s.cantidad);
+      return {
+        ...base,
+        servicio_id: s.servicio_id,
+      };
+    });
+
+    const { totalPrice, totalDeposit, remaining } = calculateTotals(detailedServices);
+    const initialStatus = totalDeposit > 0 ? "pendiente_pago" : "confirmada";
+
+    const { data: reserva, error: reservaError } = await supabase
+      .from("reservas")
+      .insert({
+        negocio_id,
+        staff_id: selectedStaffId,
+        usuario_id: client?.id || null,
+        inicio_en: start.toISOString(),
+        fin_en: end.toISOString(),
+        estado: initialStatus,
+        precio_total: totalPrice,
+        anticipo_calculado: totalDeposit,
+        saldo_pendiente: remaining,
+        cliente_manual_nombre: client ? null : manualName,
+        cliente_manual_correo: client ? null : manualEmail || null,
+        cliente_manual_telefono: client ? null : manualPhone || null,
+        nota: nota || null,
+      })
+      .select("*")
+      .single();
+
+    if (reservaError) {
+      return res.status(500).json({
+        ok: false,
+        step: "insert reserva",
+        error: reservaError.message,
+      });
+    }
+
+    const detallesPayload = detailedServices.map((ds) => ({
+      reserva_id: reserva.id,
+      servicio_id: ds.servicio_id,
+      cantidad: ds.cantidad,
+      duracion_min: ds.duracion_min,
+      precio: ds.precio,
+      anticipo_calculado: ds.anticipo_calculado * ds.cantidad,
+    }));
+
+    const { error: detallesError } = await supabase
+      .from("reserva_servicios")
+      .insert(detallesPayload);
+
+    if (detallesError) {
+      return res.status(500).json({
+        ok: false,
+        step: "insert reserva_servicios",
+        error: detallesError.message,
+      });
+    }
+
+    return res.status(201).json({
+      ok: true,
+      data: {
+        reserva,
+        client: client
+          ? {
+              id: client.id,
+              nombre: client.nombre,
+              correo: client.correo,
+            }
+          : {
+              id: null,
+              nombre: manualName,
+              correo: manualEmail || null,
+              telefono: manualPhone || null,
+              guest: true,
+            },
+        servicios: detallesPayload,
+        computed_end: end.toISOString(),
+        occupied_minutes: totalOccupiedMinutes,
+        deposit_amount: totalDeposit,
+        can_pay_deposit_online:
+          totalDeposit > 0 &&
+          !!negocio.stripe_connect_account_id &&
+          !!negocio.stripe_connect_charges_enabled &&
+          !!reserva.id,
       },
     });
   } catch (e) {
@@ -2499,6 +2876,7 @@ const reassignReservaStaffAdmin = async (req, res) => {
 module.exports = {
   createReservaCliente,
   createReservaAdmin,
+  createReservaPublic,
   getDisponibilidadPublic,
   getFechasDisponiblesPublic,
   getReservasCliente,
